@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 文档生成系统</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>AI 文档生成系统 <span class="badge">FastAPI + HTML</span></h1>
+      <p>上传 DOCX 模板，输入提示词，调用 AI 自动填充并导出 Word / PDF。</p>
+    </div>
+
+    <div class="card">
+      <h2>模板上传区</h2>
+      <label for="templateFile">上传 .docx 模板</label>
+      <input id="templateFile" type="file" accept=".docx" />
+      <button id="uploadBtn" style="margin-top:12px;">上传模板</button>
+      <div class="status" id="uploadStatus"></div>
+    </div>
+
+    <div class="card">
+      <h2>提示词输入区</h2>
+      <label for="prompt">提示词</label>
+      <textarea id="prompt" placeholder="例如：帮我写一份美国公司注册方案，预算500美元"></textarea>
+    </div>
+
+    <div class="card">
+      <h2>AI 配置区</h2>
+      <div class="row">
+        <div>
+          <label for="apiUrl">API URL</label>
+          <input id="apiUrl" type="text" value="https://api.openai.com/v1/chat/completions" />
+        </div>
+        <div>
+          <label for="model">Model</label>
+          <input id="model" type="text" value="gpt-4o-mini" />
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <label for="apiKey">API Key</label>
+        <input id="apiKey" type="password" placeholder="sk-xxxx" />
+      </div>
+      <div style="margin-top:12px;">
+        <label for="templateName">模板名称（上传后自动填充）</label>
+        <input id="templateName" type="text" placeholder="例如：my_template.docx" />
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>操作按钮</h2>
+      <div class="actions">
+        <button id="uploadBtn2">上传模板</button>
+        <button id="genDocxBtn">生成 Word</button>
+        <button id="genPdfBtn" class="secondary">生成 PDF</button>
+      </div>
+      <div class="status" id="actionStatus"></div>
+      <div class="link-list" id="downloadLinks" style="margin-top:12px;"></div>
+    </div>
+  </div>
+
+  <script>
+    const templateFile = document.getElementById('templateFile');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const uploadBtn2 = document.getElementById('uploadBtn2');
+    const uploadStatus = document.getElementById('uploadStatus');
+    const actionStatus = document.getElementById('actionStatus');
+    const downloadLinks = document.getElementById('downloadLinks');
+
+    async function uploadTemplate() {
+      const file = templateFile.files[0];
+      if (!file) {
+        uploadStatus.textContent = '请选择一个 .docx 模板文件';
+        return;
+      }
+      const formData = new FormData();
+      formData.append('file', file);
+      uploadStatus.textContent = '上传中...';
+      try {
+        const res = await fetch('/upload-template', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '上传失败');
+        uploadStatus.textContent = `上传成功：${data.template_name}`;
+        document.getElementById('templateName').value = data.template_name;
+      } catch (err) {
+        uploadStatus.textContent = `上传失败：${err.message}`;
+      }
+    }
+
+    async function generate(endpoint) {
+      const payload = {
+        prompt: document.getElementById('prompt').value.trim(),
+        api_url: document.getElementById('apiUrl').value.trim(),
+        api_key: document.getElementById('apiKey').value.trim(),
+        model: document.getElementById('model').value.trim(),
+        template_name: document.getElementById('templateName').value.trim()
+      };
+
+      if (!payload.prompt || !payload.api_url || !payload.api_key || !payload.model || !payload.template_name) {
+        actionStatus.textContent = '请完整填写提示词、AI配置和模板名称';
+        return;
+      }
+
+      actionStatus.textContent = '生成中，请稍候...';
+      downloadLinks.innerHTML = '';
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '生成失败');
+
+        actionStatus.textContent = data.message || '生成成功';
+        const link = document.createElement('a');
+        link.href = data.download_url;
+        link.textContent = `下载文件：${data.filename}`;
+        link.target = '_blank';
+        downloadLinks.appendChild(link);
+      } catch (err) {
+        actionStatus.textContent = `生成失败：${err.message}`;
+      }
+    }
+
+    uploadBtn.addEventListener('click', uploadTemplate);
+    uploadBtn2.addEventListener('click', uploadTemplate);
+    document.getElementById('genDocxBtn').addEventListener('click', () => generate('/generate-docx'));
+    document.getElementById('genPdfBtn').addEventListener('click', () => generate('/generate-pdf'));
+  </script>
+</body>
+</html>
