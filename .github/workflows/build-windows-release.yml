@@ -1,0 +1,57 @@
+name: Build Windows EXE and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v1.0.0)
+        required: true
+        default: v0.1.0
+      release_name:
+        description: Release title
+        required: true
+        default: usdoc Windows Build
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        shell: powershell
+        run: |
+          pyinstaller --noconfirm --clean --onefile run_usdoc.py --name usdoc --add-data "templates;templates" --add-data "static;static"
+
+      - name: Generate SHA256
+        shell: powershell
+        run: |
+          $hash = Get-FileHash -Path dist/usdoc.exe -Algorithm SHA256
+          $hash.Hash | Out-File -Encoding ascii dist/usdoc.exe.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.release_name }}
+          files: |
+            dist/usdoc.exe
+            dist/usdoc.exe.sha256
+          generate_release_notes: true
