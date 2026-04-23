@@ -7,12 +7,13 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List
 
 import requests
 from docx import Document
 from docxtpl import DocxTemplate
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +34,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
+GENERATION_RECORDS_FILE = DATA_DIR / "generation_records.json"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,6 +59,99 @@ class GenerateRequest(BaseModel):
     api_key: str
     model: str
     template_name: str
+
+
+generation_records: Dict[str, Dict[str, str]] = {}
+generation_records_lock = Lock()
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def dump_generation_records() -> None:
+    with generation_records_lock:
+        records = list(generation_records.values())
+        records.sort(key=lambda x: x["created_at"], reverse=True)
+        GENERATION_RECORDS_FILE.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def load_generation_records() -> None:
+    if not GENERATION_RECORDS_FILE.exists():
+        return
+
+    try:
+        records = json.loads(GENERATION_RECORDS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(records, list):
+            return
+    except Exception:
+        return
+
+    with generation_records_lock:
+        generation_records.clear()
+        for record in records:
+            if isinstance(record, dict) and record.get("id"):
+                generation_records[record["id"]] = record
+
+
+def add_generation_record(req: GenerateRequest) -> Dict[str, str]:
+    record_id = uuid.uuid4().hex
+    current_time = now_iso()
+    record = {
+        "id": record_id,
+        "prompt": req.prompt,
+        "api_url": req.api_url,
+        "model": req.model,
+        "template_name": req.template_name,
+        "status": "pending",
+        "message": "任务已创建，等待后台生成",
+        "filename": "",
+        "download_url": "",
+        "error": "",
+        "created_at": current_time,
+        "updated_at": current_time,
+    }
+
+    with generation_records_lock:
+        generation_records[record_id] = record
+
+    dump_generation_records()
+    return record
+
+
+def update_generation_record(record_id: str, **fields) -> None:
+    updated = False
+    with generation_records_lock:
+        record = generation_records.get(record_id)
+        if record:
+            record.update(fields)
+            record["updated_at"] = now_iso()
+            updated = True
+
+    if updated:
+        dump_generation_records()
+
+
+def get_generation_record(record_id: str) -> Dict[str, str]:
+    with generation_records_lock:
+        record = generation_records.get(record_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="生成记录不存在")
+        return dict(record)
+
+
+def list_generation_records(limit: int) -> List[Dict[str, str]]:
+    with generation_records_lock:
+        records = [dict(item) for item in generation_records.values()]
+
+    records.sort(key=lambda x: x["created_at"], reverse=True)
+    return records[:limit]
+
+
+load_generation_records()
 
 
 def sanitize_filename(filename: str) -> str:
@@ -317,16 +412,64 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
     }
 
 
+def run_docx_generation_task(record_id: str, request_payload: Dict[str, str]) -> None:
+    update_generation_record(
+        record_id,
+        status="processing",
+        message="后台正在生成 Word",
+        error="",
+    )
+
+    try:
+        req = GenerateRequest(**request_payload)
+        result = generate_common(req)
+        filename = result["docx_filename"]
+        update_generation_record(
+            record_id,
+            status="completed",
+            message="Word 生成完成",
+            filename=filename,
+            download_url=f"/download/{filename}",
+            error="",
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, ensure_ascii=False)
+        update_generation_record(
+            record_id,
+            status="failed",
+            message="Word 生成失败",
+            error=detail,
+        )
+    except Exception as exc:
+        update_generation_record(
+            record_id,
+            status="failed",
+            message="Word 生成失败",
+            error=str(exc),
+        )
+
+
 @app.post("/generate-docx")
-async def generate_docx(req: GenerateRequest):
-    result = generate_common(req)
-    filename = result["docx_filename"]
+async def generate_docx(req: GenerateRequest, background_tasks: BackgroundTasks):
+    record = add_generation_record(req)
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    background_tasks.add_task(run_docx_generation_task, record["id"], payload)
+
     return {
-        "message": "Word 生成成功",
-        "filename": filename,
-        "download_url": f"/download/{filename}",
-        "variables": result["variables"],
+        "message": "Word 已提交后台生成",
+        "record": record,
     }
+
+
+@app.get("/generation-records")
+async def get_generation_records(limit: int = 50):
+    safe_limit = max(1, min(limit, 200))
+    return {"records": list_generation_records(safe_limit)}
+
+
+@app.get("/generation-records/{record_id}")
+async def get_generation_record_by_id(record_id: str):
+    return {"record": get_generation_record(record_id)}
 
 
 @app.post("/generate-pdf")

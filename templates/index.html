@@ -10,7 +10,7 @@
   <div class="container">
     <div class="header">
       <h1>AI 文档生成系统 <span class="badge">FastAPI + HTML</span></h1>
-      <p>上传 DOCX 模板，输入提示词，调用 AI 自动填充并导出 Word / PDF。</p>
+      <p>上传 DOCX 模板，输入提示词后自动生成 Word 或 PDF。</p>
     </div>
 
     <div class="card">
@@ -50,24 +50,48 @@
     </div>
 
     <div class="card">
-      <h2>操作按钮</h2>
+      <h2>操作</h2>
       <div class="actions">
-        <button id="uploadBtn2">上传模板</button>
         <button id="genDocxBtn">生成 Word</button>
         <button id="genPdfBtn" class="secondary">生成 PDF</button>
       </div>
       <div class="status" id="actionStatus"></div>
       <div class="link-list" id="downloadLinks" style="margin-top:12px;"></div>
     </div>
+
+    <div class="card">
+      <h2>生成记录</h2>
+      <p class="status">每次点击“生成 Word”都会自动新增记录，后台完成后可直接下载。</p>
+      <div id="recordsList" class="record-list"></div>
+    </div>
   </div>
 
   <script>
     const templateFile = document.getElementById('templateFile');
     const uploadBtn = document.getElementById('uploadBtn');
-    const uploadBtn2 = document.getElementById('uploadBtn2');
     const uploadStatus = document.getElementById('uploadStatus');
     const actionStatus = document.getElementById('actionStatus');
     const downloadLinks = document.getElementById('downloadLinks');
+    const promptInput = document.getElementById('prompt');
+    const recordsList = document.getElementById('recordsList');
+    const genDocxBtn = document.getElementById('genDocxBtn');
+    const genPdfBtn = document.getElementById('genPdfBtn');
+
+    let recordsPollTimer = null;
+
+    function getPayload() {
+      return {
+        prompt: promptInput.value.trim(),
+        api_url: document.getElementById('apiUrl').value.trim(),
+        api_key: document.getElementById('apiKey').value.trim(),
+        model: document.getElementById('model').value.trim(),
+        template_name: document.getElementById('templateName').value.trim()
+      };
+    }
+
+    function validatePayload(payload) {
+      return payload.prompt && payload.api_url && payload.api_key && payload.model && payload.template_name;
+    }
 
     async function parseResponseData(res) {
       const raw = await res.text();
@@ -79,15 +103,121 @@
       }
     }
 
+    function formatTime(value) {
+      if (!value) return '-';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return value;
+      return d.toLocaleString();
+    }
+
+    function getStatusMeta(status) {
+      if (status === 'completed') return { text: '已完成', cls: 'status-completed' };
+      if (status === 'failed') return { text: '失败', cls: 'status-failed' };
+      if (status === 'processing') return { text: '生成中', cls: 'status-processing' };
+      return { text: '等待中', cls: 'status-pending' };
+    }
+
+    function renderRecords(records) {
+      recordsList.innerHTML = '';
+      if (!records || records.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'record-empty';
+        empty.textContent = '暂无记录';
+        recordsList.appendChild(empty);
+        return;
+      }
+
+      records.forEach((record) => {
+        const meta = getStatusMeta(record.status);
+
+        const item = document.createElement('div');
+        item.className = 'record-item';
+
+        const top = document.createElement('div');
+        top.className = 'record-top';
+
+        const title = document.createElement('div');
+        title.className = 'record-title';
+        title.textContent = `${formatTime(record.created_at)} | ${record.template_name || '-'}`;
+
+        const status = document.createElement('span');
+        status.className = `record-status ${meta.cls}`;
+        status.textContent = meta.text;
+
+        top.appendChild(title);
+        top.appendChild(status);
+
+        const prompt = document.createElement('div');
+        prompt.className = 'record-prompt';
+        prompt.textContent = record.prompt || '';
+
+        const actions = document.createElement('div');
+        actions.className = 'record-actions';
+
+        const downloadBtn = document.createElement('button');
+        downloadBtn.className = 'tiny-btn';
+        downloadBtn.textContent = '下载';
+        if (record.status === 'completed' && record.download_url) {
+          downloadBtn.addEventListener('click', () => {
+            window.open(record.download_url, '_blank');
+          });
+        } else {
+          downloadBtn.disabled = true;
+        }
+
+        const regenerateBtn = document.createElement('button');
+        regenerateBtn.className = 'tiny-btn secondary';
+        regenerateBtn.textContent = '重新生成';
+        regenerateBtn.addEventListener('click', () => {
+          promptInput.value = record.prompt || '';
+          promptInput.focus();
+          actionStatus.textContent = '已将该条记录的提示词回填到输入区，请点击“生成 Word”重新生成。';
+        });
+
+        actions.appendChild(downloadBtn);
+        actions.appendChild(regenerateBtn);
+
+        item.appendChild(top);
+        item.appendChild(prompt);
+        item.appendChild(actions);
+
+        if (record.status === 'failed' && record.error) {
+          const err = document.createElement('div');
+          err.className = 'record-error';
+          err.textContent = `失败原因：${record.error}`;
+          item.appendChild(err);
+        }
+
+        recordsList.appendChild(item);
+      });
+    }
+
+    async function loadRecords() {
+      try {
+        const res = await fetch('/generation-records?limit=30');
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || `加载记录失败 (HTTP ${res.status})`);
+        renderRecords(data.records || []);
+      } catch (err) {
+        const box = document.createElement('div');
+        box.className = 'record-empty';
+        box.textContent = `记录加载失败：${err.message}`;
+        recordsList.innerHTML = '';
+        recordsList.appendChild(box);
+      }
+    }
+
     async function uploadTemplate() {
       const file = templateFile.files[0];
       if (!file) {
         uploadStatus.textContent = '请选择一个 .docx 模板文件';
         return;
       }
+
       const formData = new FormData();
       formData.append('file', file);
       uploadStatus.textContent = '上传中...';
+
       try {
         const res = await fetch('/upload-template', {
           method: 'POST',
@@ -102,46 +232,80 @@
       }
     }
 
-    async function generate(endpoint) {
-      const payload = {
-        prompt: document.getElementById('prompt').value.trim(),
-        api_url: document.getElementById('apiUrl').value.trim(),
-        api_key: document.getElementById('apiKey').value.trim(),
-        model: document.getElementById('model').value.trim(),
-        template_name: document.getElementById('templateName').value.trim()
-      };
-
-      if (!payload.prompt || !payload.api_url || !payload.api_key || !payload.model || !payload.template_name) {
-        actionStatus.textContent = '请完整填写提示词、AI配置和模板名称';
+    async function generateDocxInBackground() {
+      const payload = getPayload();
+      if (!validatePayload(payload)) {
+        actionStatus.textContent = '请完整填写提示词、AI 配置和模板名称。';
         return;
       }
 
-      actionStatus.textContent = '生成中，请稍候...';
-      downloadLinks.innerHTML = '';
+      actionStatus.textContent = '任务已提交，后台正在生成 Word...';
+      genDocxBtn.disabled = true;
+
       try {
-        const res = await fetch(endpoint, {
+        const res = await fetch('/generate-docx', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
+        actionStatus.textContent = data.message || 'Word 已提交后台生成';
+        await loadRecords();
+      } catch (err) {
+        actionStatus.textContent = `生成失败：${err.message}`;
+      } finally {
+        genDocxBtn.disabled = false;
+      }
+    }
+
+    async function generatePdf() {
+      const payload = getPayload();
+      if (!validatePayload(payload)) {
+        actionStatus.textContent = '请完整填写提示词、AI 配置和模板名称。';
+        return;
+      }
+
+      actionStatus.textContent = '正在生成 PDF，请稍候...';
+      downloadLinks.innerHTML = '';
+      genPdfBtn.disabled = true;
+
+      try {
+        const res = await fetch('/generate-pdf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
         const data = await parseResponseData(res);
         if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
 
-        actionStatus.textContent = data.message || '生成成功';
-        const link = document.createElement('a');
-        link.href = data.download_url;
-        link.textContent = `下载文件：${data.filename}`;
-        link.target = '_blank';
-        downloadLinks.appendChild(link);
+        actionStatus.textContent = data.message || 'PDF 生成成功';
+        if (data.download_url) {
+          const link = document.createElement('a');
+          link.href = data.download_url;
+          link.target = '_blank';
+          link.textContent = `下载文件：${data.filename || 'PDF'}`;
+          downloadLinks.innerHTML = '';
+          downloadLinks.appendChild(link);
+        }
       } catch (err) {
         actionStatus.textContent = `生成失败：${err.message}`;
+      } finally {
+        genPdfBtn.disabled = false;
       }
     }
 
+    function startPollingRecords() {
+      if (recordsPollTimer) clearInterval(recordsPollTimer);
+      recordsPollTimer = setInterval(loadRecords, 3000);
+    }
+
     uploadBtn.addEventListener('click', uploadTemplate);
-    uploadBtn2.addEventListener('click', uploadTemplate);
-    document.getElementById('genDocxBtn').addEventListener('click', () => generate('/generate-docx'));
-    document.getElementById('genPdfBtn').addEventListener('click', () => generate('/generate-pdf'));
+    genDocxBtn.addEventListener('click', generateDocxInBackground);
+    genPdfBtn.addEventListener('click', generatePdf);
+
+    loadRecords();
+    startPollingRecords();
   </script>
 </body>
 </html>
