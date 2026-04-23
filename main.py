@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
+from jinja2 import TemplateSyntaxError
 from pydantic import BaseModel
 
 def resolve_base_dir() -> Path:
@@ -85,6 +86,31 @@ def extract_template_variables(template_path: Path) -> List[str]:
             ordered.append(key)
 
     return ordered
+
+
+def extract_invalid_template_placeholders(template_path: Path) -> List[str]:
+    doc = Document(str(template_path))
+    text_blocks = []
+
+    for paragraph in doc.paragraphs:
+        text_blocks.append(paragraph.text)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    text_blocks.append(paragraph.text)
+
+    full_text = "\n".join(text_blocks)
+    all_placeholders = re.findall(r"{{\s*([^{}]+?)\s*}}", full_text)
+
+    invalid = []
+    for placeholder in all_placeholders:
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", placeholder):
+            if placeholder not in invalid:
+                invalid.append(placeholder)
+
+    return invalid
 
 
 def extract_json_from_text(text: str) -> Dict[str, str]:
@@ -169,7 +195,19 @@ def call_ai_generate_json(prompt: str, api_url: str, api_key: str, model: str, v
 
 def render_docx(template_path: Path, context: Dict[str, str], output_docx: Path) -> None:
     tpl = DocxTemplate(str(template_path))
-    tpl.render(context)
+    try:
+        tpl.render(context)
+    except TemplateSyntaxError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="模板语法错误: "
+            + str(e)
+            + "。请使用 {{变量名}}，变量名仅支持字母/数字/下划线，且不能包含空格。",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"模板渲染失败: {str(e)}")
     tpl.save(str(output_docx))
 
 
@@ -240,9 +278,21 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
     if not template_path.exists():
         raise HTTPException(status_code=404, detail="模板不存在，请先上传模板")
 
+    invalid_placeholders = extract_invalid_template_placeholders(template_path)
+    if invalid_placeholders:
+        raise HTTPException(
+            status_code=400,
+            detail="模板中存在非法占位符: "
+            + str(invalid_placeholders)
+            + "。请改为 {{story_acceptance_criteria}} 这类格式。",
+        )
+
     variables = extract_template_variables(template_path)
     if not variables:
-        variables = ["company_name", "service_plan", "price", "timeline"]
+        raise HTTPException(
+            status_code=400,
+            detail="模板中未检测到有效占位符，请在 .docx 中使用 {{variable_name}} 格式。",
+        )
 
     ai_result = call_ai_generate_json(
         prompt=req.prompt,
@@ -312,3 +362,8 @@ async def download_file(filename: str):
         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
     return FileResponse(str(file_path), media_type=media_type, filename=filename)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_to_json(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {str(exc)}"})

@@ -69,6 +69,16 @@
     const actionStatus = document.getElementById('actionStatus');
     const downloadLinks = document.getElementById('downloadLinks');
 
+    async function parseResponseData(res) {
+      const raw = await res.text();
+      if (!raw) return {};
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return { detail: raw };
+      }
+    }
+
     async function uploadTemplate() {
       const file = templateFile.files[0];
       if (!file) {
@@ -83,8 +93,8 @@
           method: 'POST',
           body: formData
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || '上传失败');
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `上传失败 (HTTP ${res.status})`);
         uploadStatus.textContent = `上传成功：${data.template_name}`;
         document.getElementById('templateName').value = data.template_name;
       } catch (err) {
@@ -114,8 +124,8 @@
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(payload)
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || '生成失败');
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
 
         actionStatus.textContent = data.message || '生成成功';
         const link = document.createElement('a');
