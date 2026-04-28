@@ -44,8 +44,8 @@
         <input id="apiKey" type="password" placeholder="sk-xxxx" />
       </div>
       <div style="margin-top:12px;">
-        <label for="templateName">模板名称（上传后自动填充）</label>
-        <input id="templateName" type="text" placeholder="例如：my_template.docx" />
+        <label for="outputFilename">生成文件名称（支持自定义）</label>
+        <input id="outputFilename" type="text" placeholder="例如：my_output.docx（可不填）" />
       </div>
     </div>
 
@@ -78,6 +78,7 @@
     const genPdfBtn = document.getElementById('genPdfBtn');
 
     let recordsPollTimer = null;
+    let uploadedTemplateName = '';
 
     function getPayload() {
       return {
@@ -85,7 +86,8 @@
         api_url: document.getElementById('apiUrl').value.trim(),
         api_key: document.getElementById('apiKey').value.trim(),
         model: document.getElementById('model').value.trim(),
-        template_name: document.getElementById('templateName').value.trim()
+        template_name: uploadedTemplateName,
+        output_filename: document.getElementById('outputFilename').value.trim()
       };
     }
 
@@ -138,7 +140,7 @@
 
         const title = document.createElement('div');
         title.className = 'record-title';
-        title.textContent = `${formatTime(record.created_at)} | ${record.template_name || '-'}`;
+        title.textContent = `${formatTime(record.created_at)} | ${record.generated_filename || record.filename || '-'}`;
 
         const status = document.createElement('span');
         status.className = `record-status ${meta.cls}`;
@@ -146,10 +148,6 @@
 
         top.appendChild(title);
         top.appendChild(status);
-
-        const prompt = document.createElement('div');
-        prompt.className = 'record-prompt';
-        prompt.textContent = record.prompt || '';
 
         const actions = document.createElement('div');
         actions.className = 'record-actions';
@@ -178,7 +176,6 @@
         actions.appendChild(regenerateBtn);
 
         item.appendChild(top);
-        item.appendChild(prompt);
         item.appendChild(actions);
 
         if (record.status === 'failed' && record.error) {
@@ -226,7 +223,7 @@
         const data = await parseResponseData(res);
         if (!res.ok) throw new Error(data.detail || data.message || `上传失败 (HTTP ${res.status})`);
         uploadStatus.textContent = `上传成功：${data.template_name}`;
-        document.getElementById('templateName').value = data.template_name;
+        uploadedTemplateName = data.template_name || '';
       } catch (err) {
         uploadStatus.textContent = `上传失败：${err.message}`;
       }
@@ -235,7 +232,7 @@
     async function generateDocxInBackground() {
       const payload = getPayload();
       if (!validatePayload(payload)) {
-        actionStatus.textContent = '请完整填写提示词、AI 配置和模板名称。';
+        actionStatus.textContent = '请完整填写提示词、AI 配置，并先上传模板。';
         return;
       }
 
@@ -262,7 +259,7 @@
     async function generatePdf() {
       const payload = getPayload();
       if (!validatePayload(payload)) {
-        actionStatus.textContent = '请完整填写提示词、AI 配置和模板名称。';
+        actionStatus.textContent = '请完整填写提示词、AI 配置，并先上传模板。';
         return;
       }
 

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
@@ -13,13 +14,14 @@ from typing import Dict, List
 import requests
 from docx import Document
 from docxtpl import DocxTemplate
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
 from jinja2 import TemplateSyntaxError
+from openpyxl import load_workbook
 from pydantic import BaseModel
 
 def resolve_base_dir() -> Path:
@@ -59,6 +61,7 @@ class GenerateRequest(BaseModel):
     api_key: str
     model: str
     template_name: str
+    output_filename: str = ""
 
 
 generation_records: Dict[str, Dict[str, str]] = {}
@@ -106,6 +109,7 @@ def add_generation_record(req: GenerateRequest) -> Dict[str, str]:
         "api_url": req.api_url,
         "model": req.model,
         "template_name": req.template_name,
+        "generated_filename": req.output_filename,
         "status": "pending",
         "message": "任务已创建，等待后台生成",
         "filename": "",
@@ -157,6 +161,23 @@ load_generation_records()
 def sanitize_filename(filename: str) -> str:
     base = os.path.basename(filename)
     return re.sub(r"[^a-zA-Z0-9._-]", "_", base)
+
+
+def normalize_output_docx_filename(filename: str) -> str:
+    raw = (filename or "").strip()
+    if not raw:
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uid = uuid.uuid4().hex[:8]
+        return f"generated_{now}_{uid}.docx"
+
+    cleaned = sanitize_filename(raw)
+    if not cleaned:
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uid = uuid.uuid4().hex[:8]
+        return f"generated_{now}_{uid}.docx"
+    if not cleaned.lower().endswith(".docx"):
+        cleaned = f"{cleaned}.docx"
+    return cleaned
 
 
 def extract_template_variables(template_path: Path) -> List[str]:
@@ -397,9 +418,12 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
         variables=variables,
     )
 
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    uid = uuid.uuid4().hex[:8]
-    docx_filename = f"generated_{now}_{uid}.docx"
+    docx_filename = normalize_output_docx_filename(req.output_filename)
+    docx_path = OUTPUT_DIR / docx_filename
+    if docx_path.exists():
+        uid = uuid.uuid4().hex[:8]
+        stem = Path(docx_filename).stem
+        docx_filename = f"{stem}_{uid}.docx"
     docx_path = OUTPUT_DIR / docx_filename
 
     render_docx(template_path, ai_result, docx_path)
@@ -410,6 +434,44 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
         "variables": variables,
         "ai_result": ai_result,
     }
+
+
+def resolve_column_index(column: str, header_row: List[str]) -> int:
+    value = (column or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Excel 列不能为空")
+
+    if re.fullmatch(r"[A-Za-z]+", value):
+        idx = 0
+        for ch in value.upper():
+            idx = idx * 26 + (ord(ch) - ord("A") + 1)
+        return idx - 1
+
+    needle = value.lower()
+    for i, name in enumerate(header_row):
+        if str(name or "").strip().lower() == needle:
+            return i
+
+    raise HTTPException(status_code=400, detail=f"未找到列: {column}")
+
+
+def build_row_prompt(base_prompt: str, cell_value: str) -> str:
+    text = str(cell_value or "").strip()
+    if not text:
+        return ""
+
+    tokens = ("{{excel_value}}", "{excel_value}", "{{value}}", "{value}")
+    row_prompt = base_prompt
+    replaced = False
+    for token in tokens:
+        if token in row_prompt:
+            row_prompt = row_prompt.replace(token, text)
+            replaced = True
+
+    if not replaced:
+        row_prompt = f"{base_prompt}\n\nExcel内容: {text}"
+
+    return row_prompt.strip()
 
 
 def run_docx_generation_task(record_id: str, request_payload: Dict[str, str]) -> None:
@@ -428,6 +490,7 @@ def run_docx_generation_task(record_id: str, request_payload: Dict[str, str]) ->
             record_id,
             status="completed",
             message="Word 生成完成",
+            generated_filename=filename,
             filename=filename,
             download_url=f"/download/{filename}",
             error="",
