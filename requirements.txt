@@ -5,3 +5,4 @@ python-multipart
 docxtpl
 python-docx
 requests
+openpyxl

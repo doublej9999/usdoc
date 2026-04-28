@@ -163,6 +163,12 @@ def sanitize_filename(filename: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", base)
 
 
+def sanitize_output_filename(filename: str) -> str:
+    base = os.path.basename(filename)
+    # 允许 Unicode 字母/数字（含中文）、下划线、点和短横线
+    return re.sub(r"[^\w.\-]", "_", base, flags=re.UNICODE)
+
+
 def normalize_output_docx_filename(filename: str) -> str:
     raw = (filename or "").strip()
     if not raw:
@@ -170,7 +176,7 @@ def normalize_output_docx_filename(filename: str) -> str:
         uid = uuid.uuid4().hex[:8]
         return f"generated_{now}_{uid}.docx"
 
-    cleaned = sanitize_filename(raw)
+    cleaned = sanitize_output_filename(raw)
     if not cleaned:
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         uid = uuid.uuid4().hex[:8]
@@ -436,6 +442,36 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
     }
 
 
+def generate_default_docx(template_name: str, output_filename: str) -> str:
+    template_name = sanitize_filename(template_name)
+    template_path = UPLOAD_DIR / template_name
+    if not template_path.exists():
+        raise HTTPException(status_code=404, detail="模板不存在，请先上传模板")
+
+    invalid_placeholders = extract_invalid_template_placeholders(template_path)
+    if invalid_placeholders:
+        raise HTTPException(
+            status_code=400,
+            detail="模板中存在非法占位符: "
+            + str(invalid_placeholders)
+            + "。请改为 {{story_acceptance_criteria}} 这类格式。",
+        )
+
+    variables = extract_template_variables(template_path)
+    context = {k: "" for k in variables}
+
+    docx_filename = normalize_output_docx_filename(output_filename)
+    docx_path = OUTPUT_DIR / docx_filename
+    if docx_path.exists():
+        uid = uuid.uuid4().hex[:8]
+        stem = Path(docx_filename).stem
+        docx_filename = f"{stem}_{uid}.docx"
+        docx_path = OUTPUT_DIR / docx_filename
+
+    render_docx(template_path, context, docx_path)
+    return docx_filename
+
+
 def resolve_column_index(column: str, header_row: List[str]) -> int:
     value = (column or "").strip()
     if not value:
@@ -459,6 +495,9 @@ def build_row_prompt(base_prompt: str, cell_value: str) -> str:
     text = str(cell_value or "").strip()
     if not text:
         return ""
+
+    if not str(base_prompt or "").strip():
+        return text
 
     tokens = ("{{excel_value}}", "{excel_value}", "{{value}}", "{value}")
     row_prompt = base_prompt
@@ -524,6 +563,141 @@ async def generate_docx(req: GenerateRequest, background_tasks: BackgroundTasks)
     }
 
 
+@app.post("/generate-docx-from-excel")
+async def generate_docx_from_excel(
+    file: UploadFile = File(...),
+    prompt: str = Form(""),
+    api_url: str = Form(...),
+    api_key: str = Form(...),
+    model: str = Form(...),
+    template_name: str = Form(...),
+    sheet_name: str = Form("Sheet1"),
+    prompt_column: str = Form(...),
+    filename_column: str = Form(...),
+    output_prefix: str = Form("excel_generated"),
+):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx Excel 文件")
+
+    temp_excel_path = UPLOAD_DIR / f"excel_{uuid.uuid4().hex}.xlsx"
+    with open(temp_excel_path, "wb") as f:
+        f.write(await file.read())
+
+    workbook = None
+    try:
+        workbook = load_workbook(filename=str(temp_excel_path), read_only=True, data_only=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Excel 打开失败: {str(exc)}")
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise HTTPException(status_code=400, detail=f"未找到 sheet: {sheet_name}")
+
+        ws = workbook[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raise HTTPException(status_code=400, detail="Excel sheet 为空")
+
+        prompt_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (prompt_column or "").strip()))
+        filename_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (filename_column or "").strip()))
+        use_header = not (prompt_col_is_letter and filename_col_is_letter)
+
+        if not use_header:
+            prompt_col_index = resolve_column_index(prompt_column, [])
+            filename_col_index = resolve_column_index(filename_column, [])
+            data_rows = list(enumerate(rows, start=1))
+        else:
+            header_row = [str(item or "").strip() for item in rows[0]]
+            prompt_col_index = resolve_column_index(prompt_column, header_row)
+            filename_col_index = resolve_column_index(filename_column, header_row)
+            data_rows = list(enumerate(rows[1:], start=2))
+
+        generated_files = []
+        processed_rows = 0
+        fallback_count = 0
+        safe_prefix = sanitize_filename(output_prefix or "excel_generated")
+
+        for row_num, row in data_rows:
+            prompt_text = ""
+            file_name_text = ""
+            if prompt_col_index < len(row):
+                prompt_text = str(row[prompt_col_index] or "").strip()
+            if filename_col_index < len(row):
+                file_name_text = str(row[filename_col_index] or "").strip()
+
+            if not prompt_text:
+                continue
+
+            row_prompt = build_row_prompt(prompt, prompt_text)
+            if not row_prompt:
+                continue
+
+            output_name = sanitize_output_filename(file_name_text) if file_name_text else ""
+            if output_name and not output_name.lower().endswith(".docx"):
+                output_name = f"{output_name}.docx"
+            if not output_name:
+                output_name = f"{safe_prefix}_row{row_num}.docx"
+
+            req = GenerateRequest(
+                prompt=row_prompt,
+                api_url=api_url,
+                api_key=api_key,
+                model=model,
+                template_name=template_name,
+                output_filename=output_name,
+            )
+
+            success = False
+            for _ in range(5):
+                try:
+                    result = generate_common(req)
+                    generated_files.append(result["docx_filename"])
+                    processed_rows += 1
+                    success = True
+                    break
+                except Exception:
+                    pass
+
+            if success:
+                continue
+
+            fail_name = output_name
+            if fail_name.lower().endswith(".docx"):
+                fail_name = f"{fail_name[:-5]}_fail.docx"
+            else:
+                fail_name = f"{fail_name}_fail.docx"
+            default_filename = generate_default_docx(template_name, fail_name)
+            generated_files.append(default_filename)
+            processed_rows += 1
+            fallback_count += 1
+
+        if not generated_files:
+            raise HTTPException(status_code=400, detail="提示词列没有可用数据，未生成文件")
+
+        zip_filename = f"{safe_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        zip_path = OUTPUT_DIR / zip_filename
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for filename in generated_files:
+                source = OUTPUT_DIR / filename
+                if source.exists():
+                    zf.write(source, arcname=filename)
+
+        return {
+            "message": f"批量生成完成，共 {processed_rows} 个 Word，失败回退 {fallback_count} 个",
+            "count": processed_rows,
+            "fallback_count": fallback_count,
+            "sheet_name": sheet_name,
+            "prompt_column": prompt_column,
+            "filename_column": filename_column,
+            "zip_filename": zip_filename,
+            "download_url": f"/download/{zip_filename}",
+            "files": generated_files,
+        }
+    finally:
+        if workbook is not None:
+            workbook.close()
+        temp_excel_path.unlink(missing_ok=True)
+
+
 @app.get("/generation-records")
 async def get_generation_records(limit: int = 50):
     safe_limit = max(1, min(limit, 200))
@@ -566,6 +740,8 @@ async def download_file(filename: str):
         media_type = "application/pdf"
     elif filename.lower().endswith(".docx"):
         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif filename.lower().endswith(".zip"):
+        media_type = "application/zip"
 
     return FileResponse(str(file_path), media_type=media_type, filename=filename)
 

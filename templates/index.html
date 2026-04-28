@@ -25,6 +25,31 @@
       <h2>提示词输入区</h2>
       <label for="prompt">提示词</label>
       <textarea id="prompt" placeholder="例如：帮我写一份美国公司注册方案，预算500美元"></textarea>
+      <p class="status">批量导入时支持占位符：<code>{{excel_value}}</code> 或 <code>{excel_value}</code>。若留空提示词，则直接使用 Excel 指定列内容作为提示词。</p>
+    </div>
+
+    <div class="card">
+      <h2>Excel 导入生成</h2>
+      <label for="excelFile">上传 .xlsx 文件</label>
+      <input id="excelFile" type="file" accept=".xlsx" />
+      <div class="row" style="margin-top:12px;">
+        <div>
+          <label for="sheetName">Sheet 名称（默认 Sheet1）</label>
+          <input id="sheetName" type="text" value="Sheet1" />
+        </div>
+        <div>
+          <label for="promptColumnName">提示词列（字母或标题）</label>
+          <input id="promptColumnName" type="text" placeholder="例如 A 或 prompt_text" />
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <label for="filenameColumnName">文件名列（字母或标题）</label>
+        <input id="filenameColumnName" type="text" placeholder="例如 B 或 output_name" />
+      </div>
+      <div style="margin-top:12px;">
+        <label for="outputPrefix">输出文件前缀</label>
+        <input id="outputPrefix" type="text" value="excel_generated" />
+      </div>
     </div>
 
     <div class="card">
@@ -54,6 +79,7 @@
       <div class="actions">
         <button id="genDocxBtn">生成 Word</button>
         <button id="genPdfBtn" class="secondary">生成 PDF</button>
+        <button id="genFromExcelBtn" class="secondary">Excel 批量生成 Word</button>
       </div>
       <div class="status" id="actionStatus"></div>
       <div class="link-list" id="downloadLinks" style="margin-top:12px;"></div>
@@ -74,8 +100,14 @@
     const downloadLinks = document.getElementById('downloadLinks');
     const promptInput = document.getElementById('prompt');
     const recordsList = document.getElementById('recordsList');
+    const excelFileInput = document.getElementById('excelFile');
+    const sheetNameInput = document.getElementById('sheetName');
+    const promptColumnNameInput = document.getElementById('promptColumnName');
+    const filenameColumnNameInput = document.getElementById('filenameColumnName');
+    const outputPrefixInput = document.getElementById('outputPrefix');
     const genDocxBtn = document.getElementById('genDocxBtn');
     const genPdfBtn = document.getElementById('genPdfBtn');
+    const genFromExcelBtn = document.getElementById('genFromExcelBtn');
 
     let recordsPollTimer = null;
     let uploadedTemplateName = '';
@@ -292,6 +324,66 @@
       }
     }
 
+    async function generateFromExcel() {
+      if (!uploadedTemplateName) {
+        actionStatus.textContent = '请先上传模板。';
+        return;
+      }
+      if (!excelFileInput.files[0]) {
+        actionStatus.textContent = '请先选择 .xlsx 文件。';
+        return;
+      }
+      const payload = getPayload();
+      if (!payload.api_url || !payload.api_key || !payload.model) {
+        actionStatus.textContent = '请完整填写 AI 配置。';
+        return;
+      }
+      const promptColumn = (promptColumnNameInput.value || '').trim();
+      const filenameColumn = (filenameColumnNameInput.value || '').trim();
+      if (!promptColumn || !filenameColumn) {
+        actionStatus.textContent = '请填写提示词列和文件名列（例如 A/B 或列标题）。';
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', excelFileInput.files[0]);
+      formData.append('prompt', payload.prompt);
+      formData.append('api_url', payload.api_url);
+      formData.append('api_key', payload.api_key);
+      formData.append('model', payload.model);
+      formData.append('template_name', uploadedTemplateName);
+      formData.append('sheet_name', (sheetNameInput.value || 'Sheet1').trim() || 'Sheet1');
+      formData.append('prompt_column', promptColumn);
+      formData.append('filename_column', filenameColumn);
+      formData.append('output_prefix', (outputPrefixInput.value || 'excel_generated').trim() || 'excel_generated');
+
+      actionStatus.textContent = '正在按 Excel 批量生成 Word，请稍候...';
+      downloadLinks.innerHTML = '';
+      genFromExcelBtn.disabled = true;
+
+      try {
+        const res = await fetch('/generate-docx-from-excel', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `批量生成失败 (HTTP ${res.status})`);
+
+        actionStatus.textContent = data.message || '批量生成成功';
+        if (data.download_url) {
+          const link = document.createElement('a');
+          link.href = data.download_url;
+          link.target = '_blank';
+          link.textContent = `下载打包文件：${data.zip_filename || 'generated.zip'}`;
+          downloadLinks.appendChild(link);
+        }
+      } catch (err) {
+        actionStatus.textContent = `批量生成失败：${err.message}`;
+      } finally {
+        genFromExcelBtn.disabled = false;
+      }
+    }
+
     function startPollingRecords() {
       if (recordsPollTimer) clearInterval(recordsPollTimer);
       recordsPollTimer = setInterval(loadRecords, 3000);
@@ -300,6 +392,7 @@
     uploadBtn.addEventListener('click', uploadTemplate);
     genDocxBtn.addEventListener('click', generateDocxInBackground);
     genPdfBtn.addEventListener('click', generatePdf);
+    genFromExcelBtn.addEventListener('click', generateFromExcel);
 
     loadRecords();
     startPollingRecords();
