@@ -10,3 +10,5 @@ dist/
 *.log
 ~$*.docx
 generation_records.json
+*.docx
+.pytest_cache/
