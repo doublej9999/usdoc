@@ -6,10 +6,11 @@ import subprocess
 import sys
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 from docx import Document
@@ -66,6 +67,11 @@ class GenerateRequest(BaseModel):
 
 generation_records: Dict[str, Dict[str, str]] = {}
 generation_records_lock = Lock()
+
+# 批量任务全局存储与锁
+BATCH_TASKS_FILE = DATA_DIR / "batch_tasks.json"
+batch_tasks: Dict[str, Dict] = {}
+batch_tasks_lock = Lock()
 
 
 def now_iso() -> str:
@@ -156,6 +162,126 @@ def list_generation_records(limit: int) -> List[Dict[str, str]]:
 
 
 load_generation_records()
+
+
+def dump_batch_tasks() -> None:
+    with batch_tasks_lock:
+        tasks = []
+        for item in batch_tasks.values():
+            copy_item = dict(item)
+            # 安全脱敏 api_key，不将明文 key 落盘
+            if "api_key" in copy_item:
+                key = copy_item["api_key"]
+                copy_item["api_key"] = f"{key[:3]}***{key[-3:]}" if len(key) > 6 else "***"
+            tasks.append(copy_item)
+        tasks.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        try:
+            BATCH_TASKS_FILE.write_text(
+                json.dumps(tasks, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+
+def load_batch_tasks() -> None:
+    if not BATCH_TASKS_FILE.exists():
+        return
+
+    try:
+        tasks = json.loads(BATCH_TASKS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(tasks, list):
+            return
+    except Exception:
+        return
+
+    with batch_tasks_lock:
+        batch_tasks.clear()
+        for task in tasks:
+            if isinstance(task, dict) and task.get("id"):
+                batch_tasks[task["id"]] = task
+
+
+load_batch_tasks()
+
+
+def append_batch_log(batch_id: str, level: str, message: str) -> None:
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            return
+        log_entry = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "level": level,
+            "message": message,
+        }
+        logs = task.setdefault("logs", [])
+        logs.append(log_entry)
+        if len(logs) > 500:
+            task["logs"] = logs[-500:]
+
+
+def update_batch_task_summary(batch_id: str) -> None:
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            return
+        items = task.get("items", {})
+        total = len(items)
+        success_count = sum(1 for it in items.values() if it.get("status") == "success")
+        failed_count = sum(1 for it in items.values() if it.get("status") == "failed")
+        running_count = sum(1 for it in items.values() if it.get("status") == "running")
+        pending_count = sum(1 for it in items.values() if it.get("status") == "pending")
+        completed_count = success_count + failed_count
+
+        task["total"] = total
+        task["completed"] = completed_count
+        task["success_count"] = success_count
+        task["failed_count"] = failed_count
+        task["running_count"] = running_count
+        task["pending_count"] = pending_count
+
+        if running_count > 0 or pending_count > 0:
+            task["status"] = "running"
+        elif failed_count > 0 and success_count > 0:
+            task["status"] = "partial_failed"
+        elif failed_count > 0 and success_count == 0:
+            task["status"] = "failed"
+        else:
+            task["status"] = "completed"
+
+        task["updated_at"] = now_iso()
+
+    dump_batch_tasks()
+
+
+def repack_batch_zip(batch_id: str) -> Optional[str]:
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            return None
+        items = list(task.get("items", {}).values())
+        safe_prefix = sanitize_filename(task.get("output_prefix") or "batch_generated")
+
+    success_files = [it["generated_filename"] for it in items if it.get("status") == "success" and it.get("generated_filename")]
+    if not success_files:
+        return None
+
+    zip_filename = f"{safe_prefix}_{batch_id[:8]}.zip"
+    zip_path = OUTPUT_DIR / zip_filename
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fname in success_files:
+            file_path = OUTPUT_DIR / fname
+            if file_path.exists():
+                zf.write(file_path, arcname=fname)
+
+    with batch_tasks_lock:
+        if batch_id in batch_tasks:
+            batch_tasks[batch_id]["zip_filename"] = zip_filename
+            batch_tasks[batch_id]["download_url"] = f"/download/{zip_filename}"
+
+    dump_batch_tasks()
+    return zip_filename
 
 
 def sanitize_filename(filename: str) -> str:
@@ -561,6 +687,303 @@ async def generate_docx(req: GenerateRequest, background_tasks: BackgroundTasks)
         "message": "Word 已提交后台生成",
         "record": record,
     }
+
+
+def execute_single_item(batch_id: str, item_id: str) -> None:
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            return
+        item = task.get("items", {}).get(item_id)
+        if not item:
+            return
+        item["status"] = "running"
+        item["error"] = ""
+        template_name = task["template_name"]
+        api_url = task["api_url"]
+        api_key = task["api_key"]
+        model = task["model"]
+        row_num = item["row_num"]
+        row_prompt = item["row_prompt"]
+        output_filename = item["output_filename"]
+
+    append_batch_log(batch_id, "INFO", f"[行 {row_num}] 开始生成: {output_filename}")
+    update_batch_task_summary(batch_id)
+
+    req = GenerateRequest(
+        prompt=row_prompt,
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        template_name=template_name,
+        output_filename=output_filename,
+    )
+
+    max_retries = 2
+    success = False
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = generate_common(req)
+            success = True
+            with batch_tasks_lock:
+                item = batch_tasks[batch_id]["items"][item_id]
+                item["status"] = "success"
+                item["generated_filename"] = res["docx_filename"]
+                item["error"] = ""
+            append_batch_log(batch_id, "SUCCESS", f"[行 {row_num}] 生成成功: {res['docx_filename']}")
+            break
+        except HTTPException as he:
+            last_err = he.detail if isinstance(he.detail, str) else str(he.detail)
+            if attempt < max_retries:
+                append_batch_log(batch_id, "WARNING", f"[行 {row_num}] 第 {attempt} 次重试失败: {last_err}")
+        except Exception as ex:
+            last_err = str(ex)
+            if attempt < max_retries:
+                append_batch_log(batch_id, "WARNING", f"[行 {row_num}] 第 {attempt} 次重试失败: {last_err}")
+
+    if not success:
+        with batch_tasks_lock:
+            item = batch_tasks[batch_id]["items"][item_id]
+            item["status"] = "failed"
+            item["error"] = last_err
+        append_batch_log(batch_id, "ERROR", f"[行 {row_num}] 生成失败: {last_err}")
+
+    update_batch_task_summary(batch_id)
+
+
+def run_batch_generation_task(batch_id: str, concurrency: int = 5) -> None:
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            return
+        item_ids = [item_id for item_id, it in task.get("items", {}).items() if it.get("status") in ("pending", "failed")]
+
+    safe_concurrency = max(1, min(concurrency, 10))
+    append_batch_log(batch_id, "INFO", f"启动批处理引擎，任务项: {len(item_ids)} 个，并发数: {safe_concurrency}")
+
+    with ThreadPoolExecutor(max_workers=safe_concurrency) as executor:
+        futures = {executor.submit(execute_single_item, batch_id, item_id): item_id for item_id in item_ids}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                append_batch_log(batch_id, "ERROR", f"执行异常: {str(exc)}")
+
+    # 尝试更新一次压缩包
+    zip_name = repack_batch_zip(batch_id)
+    with batch_tasks_lock:
+        t = batch_tasks.get(batch_id)
+        if t:
+            succ = t.get("success_count", 0)
+            fail = t.get("failed_count", 0)
+            if zip_name:
+                append_batch_log(batch_id, "SUCCESS", f"本轮处理完成！成功: {succ}, 失败: {fail}。打包完成: {zip_name}")
+            else:
+                append_batch_log(batch_id, "WARNING", f"本轮处理完成！成功: {succ}, 失败: {fail}。暂无成功文件打包。")
+
+    update_batch_task_summary(batch_id)
+
+
+@app.post("/batch-tasks")
+async def create_batch_task(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    prompt: str = Form(""),
+    api_url: str = Form(...),
+    api_key: str = Form(...),
+    model: str = Form(...),
+    template_name: str = Form(...),
+    sheet_name: str = Form("Sheet1"),
+    prompt_column: str = Form(...),
+    filename_column: str = Form(...),
+    output_prefix: str = Form("excel_generated"),
+    concurrency: int = Form(5),
+):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx Excel 文件")
+
+    temp_excel_path = UPLOAD_DIR / f"excel_{uuid.uuid4().hex}.xlsx"
+    with open(temp_excel_path, "wb") as f:
+        f.write(await file.read())
+
+    workbook = None
+    try:
+        workbook = load_workbook(filename=str(temp_excel_path), read_only=True, data_only=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Excel 打开失败: {str(exc)}")
+
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise HTTPException(status_code=400, detail=f"未找到 sheet: {sheet_name}")
+
+        ws = workbook[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            raise HTTPException(status_code=400, detail="Excel sheet 为空")
+
+        prompt_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (prompt_column or "").strip()))
+        filename_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (filename_column or "").strip()))
+        use_header = not (prompt_col_is_letter and filename_col_is_letter)
+
+        if not use_header:
+            prompt_col_index = resolve_column_index(prompt_column, [])
+            filename_col_index = resolve_column_index(filename_column, [])
+            data_rows = list(enumerate(rows, start=1))
+        else:
+            header_row = [str(item or "").strip() for item in rows[0]]
+            prompt_col_index = resolve_column_index(prompt_column, header_row)
+            filename_col_index = resolve_column_index(filename_column, header_row)
+            data_rows = list(enumerate(rows[1:], start=2))
+
+        safe_prefix = sanitize_filename(output_prefix or "excel_generated")
+        items = {}
+
+        for row_num, row in data_rows:
+            prompt_text = ""
+            file_name_text = ""
+            if prompt_col_index < len(row):
+                prompt_text = str(row[prompt_col_index] or "").strip()
+            if filename_col_index < len(row):
+                file_name_text = str(row[filename_col_index] or "").strip()
+
+            if not prompt_text:
+                continue
+
+            row_prompt = build_row_prompt(prompt, prompt_text)
+            if not row_prompt:
+                continue
+
+            output_name = sanitize_output_filename(file_name_text) if file_name_text else ""
+            if output_name and not output_name.lower().endswith(".docx"):
+                output_name = f"{output_name}.docx"
+            if not output_name:
+                output_name = f"{safe_prefix}_row{row_num}.docx"
+
+            item_id = f"item_{row_num}_{uuid.uuid4().hex[:6]}"
+            items[item_id] = {
+                "item_id": item_id,
+                "row_num": row_num,
+                "prompt_text": prompt_text,
+                "row_prompt": row_prompt,
+                "output_filename": output_name,
+                "status": "pending",
+                "generated_filename": "",
+                "error": "",
+            }
+
+        if not items:
+            raise HTTPException(status_code=400, detail="提示词列没有可用数据，未生成任务项")
+
+        batch_id = uuid.uuid4().hex
+        now_time = now_iso()
+        task = {
+            "id": batch_id,
+            "created_at": now_time,
+            "updated_at": now_time,
+            "template_name": template_name,
+            "sheet_name": sheet_name,
+            "prompt_column": prompt_column,
+            "filename_column": filename_column,
+            "output_prefix": safe_prefix,
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": model,
+            "concurrency": max(1, min(concurrency, 10)),
+            "status": "running",
+            "total": len(items),
+            "completed": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "running_count": 0,
+            "pending_count": len(items),
+            "zip_filename": "",
+            "download_url": "",
+            "logs": [],
+            "items": items,
+        }
+
+        with batch_tasks_lock:
+            batch_tasks[batch_id] = task
+
+        dump_batch_tasks()
+        append_batch_log(batch_id, "INFO", f"任务创建成功，共解析出 {len(items)} 条待处理行。")
+
+        background_tasks.add_task(run_batch_generation_task, batch_id, task["concurrency"])
+
+        return {
+            "message": "批量任务已创建并启动并发生成",
+            "batch_id": batch_id,
+            "total": len(items),
+        }
+    finally:
+        if workbook is not None:
+            workbook.close()
+        temp_excel_path.unlink(missing_ok=True)
+
+
+@app.get("/batch-tasks/{batch_id}")
+async def get_batch_task(batch_id: str):
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="批量任务不存在")
+        # 复制返回，并对 key 脱敏
+        res = dict(task)
+        if "api_key" in res:
+            k = res["api_key"]
+            res["api_key"] = f"{k[:3]}***{k[-3:]}" if len(k) > 6 else "***"
+        return res
+
+
+@app.post("/batch-tasks/{batch_id}/retry-failed")
+async def retry_failed_batch_items(batch_id: str, background_tasks: BackgroundTasks):
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="批量任务不存在")
+        failed_items = [it for it in task.get("items", {}).values() if it.get("status") == "failed"]
+        if not failed_items:
+            return {"message": "当前没有失败的任务项需要重试", "retried_count": 0}
+
+        for it in failed_items:
+            it["status"] = "pending"
+            it["error"] = ""
+
+        task["status"] = "running"
+        concurrency = task.get("concurrency", 5)
+
+    update_batch_task_summary(batch_id)
+    append_batch_log(batch_id, "INFO", f"触发重试失败项，共 {len(failed_items)} 项重试中...")
+    background_tasks.add_task(run_batch_generation_task, batch_id, concurrency)
+
+    return {"message": f"已将 {len(failed_items)} 个失败项加入重试队列", "retried_count": len(failed_items)}
+
+
+@app.post("/batch-tasks/{batch_id}/items/{item_id}/retry")
+async def retry_single_batch_item(batch_id: str, item_id: str, background_tasks: BackgroundTasks):
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="批量任务不存在")
+        item = task.get("items", {}).get(item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="任务项不存在")
+
+        item["status"] = "pending"
+        item["error"] = ""
+        task["status"] = "running"
+
+    update_batch_task_summary(batch_id)
+    append_batch_log(batch_id, "INFO", f"[行 {item.get('row_num')}] 单独重试已加入队列")
+
+    def _single_runner():
+        execute_single_item(batch_id, item_id)
+        repack_batch_zip(batch_id)
+        update_batch_task_summary(batch_id)
+
+    background_tasks.add_task(_single_runner)
+    return {"message": f"行 {item.get('row_num')} 已加入单独重试队列"}
 
 
 @app.post("/generate-docx-from-excel")

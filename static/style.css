@@ -166,10 +166,110 @@ button:disabled { opacity: .6; cursor: not-allowed; }
 .tiny-btn.secondary {
   background: #4b5563;
 }
+.tiny-btn.retry-btn {
+  background: #dc2626;
+}
+.tiny-btn.retry-btn:hover {
+  background: #b91c1c;
+}
 .record-error {
   margin-top: 8px;
   color: #b91c1c;
   font-size: 13px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 批量任务控制台样式 */
+.batch-progress-container {
+  width: 100%;
+  background: #e5e7eb;
+  border-radius: 999px;
+  overflow: hidden;
+  height: 20px;
+  margin-bottom: 16px;
+}
+.batch-progress-bar {
+  background: #2563eb;
+  height: 100%;
+  color: #fff;
+  font-size: 11px;
+  line-height: 20px;
+  text-align: center;
+  font-weight: 700;
+  transition: width 0.3s ease;
+}
+.batch-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+@media (max-width: 640px) {
+  .batch-stats-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+.batch-stat-card {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 10px 12px;
+  text-align: center;
+}
+.batch-stat-label {
+  display: block;
+  font-size: 12px;
+  color: #6b7280;
+  margin-bottom: 4px;
+}
+.batch-stat-value {
+  display: block;
+  font-size: 18px;
+  font-weight: 700;
+  color: #111827;
+}
+.text-success { color: #16a34a !important; }
+.text-failed { color: #dc2626 !important; }
+
+.batch-terminal {
+  background: #1e293b;
+  color: #f1f5f9;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  height: 180px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  line-height: 1.5;
+}
+.terminal-line { word-break: break-all; }
+.terminal-info { color: #94a3b8; }
+.terminal-success { color: #4ade80; }
+.terminal-warning { color: #facc15; }
+.terminal-error { color: #f87171; }
+
+.batch-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 250px;
+  overflow-y: auto;
+  border: 1px solid #fee2e2;
+  background: #fff5f5;
+  border-radius: 8px;
+  padding: 10px;
+}
+.batch-failed-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  font-size: 13px;
 }

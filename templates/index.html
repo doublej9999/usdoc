@@ -50,6 +50,16 @@
         <label for="outputPrefix">输出文件前缀</label>
         <input id="outputPrefix" type="text" value="excel_generated" />
       </div>
+      <div style="margin-top:12px;">
+        <label for="concurrencySelect">批量生成并发数 (建议 3~5)</label>
+        <select id="concurrencySelect">
+          <option value="1">1 (串行稳定)</option>
+          <option value="3">3 (较快)</option>
+          <option value="5" selected>5 (推荐)</option>
+          <option value="8">8 (高速)</option>
+          <option value="10">10 (极速，需确认服务商限流)</option>
+        </select>
+      </div>
     </div>
 
     <div class="card">
@@ -83,6 +93,51 @@
       </div>
       <div class="status" id="actionStatus"></div>
       <div class="link-list" id="downloadLinks" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card" id="batchSection" style="display:none;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h2 style="margin:0;">批量生成控制台</h2>
+        <button id="batchDownloadBtn" class="tiny-btn" style="width:auto; padding:6px 14px; display:none;">下载完整打包 (.zip)</button>
+      </div>
+
+      <!-- 进度指示面板 -->
+      <div class="batch-progress-container">
+        <div class="batch-progress-bar" id="batchProgressBar" style="width: 0%;"></div>
+      </div>
+      <div class="batch-stats-grid">
+        <div class="batch-stat-card">
+          <span class="batch-stat-label">总任务数</span>
+          <span class="batch-stat-value" id="batchStatTotal">0</span>
+        </div>
+        <div class="batch-stat-card">
+          <span class="batch-stat-label">已成功</span>
+          <span class="batch-stat-value text-success" id="batchStatSuccess">0</span>
+        </div>
+        <div class="batch-stat-card">
+          <span class="batch-stat-label">已失败</span>
+          <span class="batch-stat-value text-failed" id="batchStatFailed">0</span>
+        </div>
+        <div class="batch-stat-card">
+          <span class="batch-stat-label">处理状态</span>
+          <span class="batch-stat-value" id="batchStatStatus">准备中</span>
+        </div>
+      </div>
+
+      <!-- 实时日志终端 -->
+      <div style="margin-top:16px;">
+        <label>实时运行日志</label>
+        <div class="batch-terminal" id="batchTerminal"></div>
+      </div>
+
+      <!-- 失败补全区域 -->
+      <div id="batchFailedSection" style="margin-top:16px; display:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <h3 style="margin:0; font-size:15px; color:#dc2626;">失败项列表（可补全重试）</h3>
+          <button id="retryAllFailedBtn" class="tiny-btn retry-btn" style="width:auto; padding:6px 12px;">一键并发重试全部失败项</button>
+        </div>
+        <div class="batch-items-list" id="batchFailedItemsList"></div>
+      </div>
     </div>
 
     <div class="card">
@@ -324,6 +379,146 @@
       }
     }
 
+    let currentBatchId = null;
+    let batchPollTimer = null;
+    let lastLogCount = 0;
+
+    const batchSection = document.getElementById('batchSection');
+    const batchProgressBar = document.getElementById('batchProgressBar');
+    const batchStatTotal = document.getElementById('batchStatTotal');
+    const batchStatSuccess = document.getElementById('batchStatSuccess');
+    const batchStatFailed = document.getElementById('batchStatFailed');
+    const batchStatStatus = document.getElementById('batchStatStatus');
+    const batchTerminal = document.getElementById('batchTerminal');
+    const batchDownloadBtn = document.getElementById('batchDownloadBtn');
+    const batchFailedSection = document.getElementById('batchFailedSection');
+    const batchFailedItemsList = document.getElementById('batchFailedItemsList');
+    const retryAllFailedBtn = document.getElementById('retryAllFailedBtn');
+    const concurrencySelect = document.getElementById('concurrencySelect');
+
+    function renderBatchTask(task) {
+      if (!task) return;
+      batchSection.style.display = 'block';
+
+      const total = task.total || 0;
+      const completed = (task.success_count || 0) + (task.failed_count || 0);
+      const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+      batchProgressBar.style.width = `${percent}%`;
+      batchProgressBar.textContent = `${percent}%`;
+
+      batchStatTotal.textContent = total;
+      batchStatSuccess.textContent = task.success_count || 0;
+      batchStatFailed.textContent = task.failed_count || 0;
+
+      let statusText = '处理中';
+      if (task.status === 'completed') statusText = '全部完成';
+      else if (task.status === 'partial_failed') statusText = '部分失败';
+      else if (task.status === 'failed') statusText = '全部失败';
+      batchStatStatus.textContent = statusText;
+
+      // 下载按钮
+      if (task.download_url) {
+        batchDownloadBtn.style.display = 'inline-block';
+        batchDownloadBtn.onclick = () => window.open(task.download_url, '_blank');
+      } else {
+        batchDownloadBtn.style.display = 'none';
+      }
+
+      // 实时日志
+      const logs = task.logs || [];
+      if (logs.length !== lastLogCount) {
+        lastLogCount = logs.length;
+        batchTerminal.innerHTML = '';
+        logs.forEach(log => {
+          const div = document.createElement('div');
+          div.className = `terminal-line terminal-${(log.level || 'info').toLowerCase()}`;
+          div.textContent = `[${log.time}] [${log.level}] ${log.message}`;
+          batchTerminal.appendChild(div);
+        });
+        batchTerminal.scrollTop = batchTerminal.scrollHeight;
+      }
+
+      // 失败项展示与补全
+      const items = Object.values(task.items || {});
+      const failedItems = items.filter(it => it.status === 'failed');
+
+      if (failedItems.length > 0) {
+        batchFailedSection.style.display = 'block';
+        batchFailedItemsList.innerHTML = '';
+        failedItems.forEach(it => {
+          const itemDiv = document.createElement('div');
+          itemDiv.className = 'batch-failed-item';
+
+          const infoDiv = document.createElement('div');
+          infoDiv.style.flex = '1';
+          infoDiv.innerHTML = `<div><strong>第 ${it.row_num} 行：</strong>${it.output_filename}</div><div class="record-error" style="margin-top:4px;">错误: ${it.error || '未知异常'}</div>`;
+
+          const retryBtn = document.createElement('button');
+          retryBtn.className = 'tiny-btn secondary';
+          retryBtn.style.width = 'auto';
+          retryBtn.textContent = '补全重试';
+          retryBtn.onclick = () => retrySingleItem(task.id, it.item_id);
+
+          itemDiv.appendChild(infoDiv);
+          itemDiv.appendChild(retryBtn);
+          batchFailedItemsList.appendChild(itemDiv);
+        });
+      } else {
+        batchFailedSection.style.display = 'none';
+        batchFailedItemsList.innerHTML = '';
+      }
+    }
+
+    async function pollBatchStatus() {
+      if (!currentBatchId) return;
+      try {
+        const res = await fetch(`/batch-tasks/${currentBatchId}`);
+        if (!res.ok) return;
+        const task = await res.json();
+        renderBatchTask(task);
+
+        if (task.status === 'completed' || task.status === 'partial_failed' || task.status === 'failed') {
+          // 已经结束，但为了响应重试状态，继续保持较低频率轮询或等有重试再唤醒
+          if (task.running_count === 0 && task.pending_count === 0) {
+            genFromExcelBtn.disabled = false;
+          }
+        }
+      } catch (err) {
+        console.error("轮询批任务失败:", err);
+      }
+    }
+
+    async function retrySingleItem(batchId, itemId) {
+      try {
+        actionStatus.textContent = '已提交单项补全重试...';
+        const res = await fetch(`/batch-tasks/${batchId}/items/${itemId}/retry`, { method: 'POST' });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || '重试失败');
+        actionStatus.textContent = data.message;
+        pollBatchStatus();
+      } catch (err) {
+        actionStatus.textContent = `重试失败：${err.message}`;
+      }
+    }
+
+    async function retryAllFailed() {
+      if (!currentBatchId) return;
+      retryAllFailedBtn.disabled = true;
+      try {
+        actionStatus.textContent = '已提交所有失败项重试...';
+        const res = await fetch(`/batch-tasks/${currentBatchId}/retry-failed`, { method: 'POST' });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || '重试失败');
+        actionStatus.textContent = data.message;
+        pollBatchStatus();
+      } catch (err) {
+        actionStatus.textContent = `重试失败：${err.message}`;
+      } finally {
+        retryAllFailedBtn.disabled = false;
+      }
+    }
+
     async function generateFromExcel() {
       if (!uploadedTemplateName) {
         actionStatus.textContent = '请先上传模板。';
@@ -356,33 +551,34 @@
       formData.append('prompt_column', promptColumn);
       formData.append('filename_column', filenameColumn);
       formData.append('output_prefix', (outputPrefixInput.value || 'excel_generated').trim() || 'excel_generated');
+      formData.append('concurrency', concurrencySelect.value || 5);
 
-      actionStatus.textContent = '正在按 Excel 批量生成 Word，请稍候...';
+      actionStatus.textContent = '正在创建并发批量任务，请稍候...';
       downloadLinks.innerHTML = '';
       genFromExcelBtn.disabled = true;
+      lastLogCount = 0;
 
       try {
-        const res = await fetch('/generate-docx-from-excel', {
+        const res = await fetch('/batch-tasks', {
           method: 'POST',
           body: formData
         });
         const data = await parseResponseData(res);
-        if (!res.ok) throw new Error(data.detail || data.message || `批量生成失败 (HTTP ${res.status})`);
+        if (!res.ok) throw new Error(data.detail || data.message || `批量生成提交失败 (HTTP ${res.status})`);
 
-        actionStatus.textContent = data.message || '批量生成成功';
-        if (data.download_url) {
-          const link = document.createElement('a');
-          link.href = data.download_url;
-          link.target = '_blank';
-          link.textContent = `下载打包文件：${data.zip_filename || 'generated.zip'}`;
-          downloadLinks.appendChild(link);
-        }
+        currentBatchId = data.batch_id;
+        actionStatus.textContent = `批量任务已启动 (共 ${data.total} 项)，并发生成中...`;
+
+        if (batchPollTimer) clearInterval(batchPollTimer);
+        batchPollTimer = setInterval(pollBatchStatus, 1500);
+        pollBatchStatus();
       } catch (err) {
-        actionStatus.textContent = `批量生成失败：${err.message}`;
-      } finally {
+        actionStatus.textContent = `批量任务启动失败：${err.message}`;
         genFromExcelBtn.disabled = false;
       }
     }
+
+    retryAllFailedBtn.addEventListener('click', retryAllFailed);
 
     function startPollingRecords() {
       if (recordsPollTimer) clearInterval(recordsPollTimer);
