@@ -273,3 +273,52 @@ button:disabled { opacity: .6; cursor: not-allowed; }
   border-radius: 6px;
   font-size: 13px;
 }
+
+/* 模板变量预览徽章区 */
+.template-vars-box {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+}
+.template-vars-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.template-vars-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.var-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #e0e7ff;
+  color: #3730a3;
+  padding: 3px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  cursor: pointer;
+  border: 1px solid #c7d2fe;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.var-badge:hover {
+  background: #c7d2fe;
+  color: #1e1b4b;
+  transform: translateY(-1px);
+}
+.var-badge-invalid {
+  background: #fee2e2;
+  color: #991b1b;
+  border-color: #fca5a5;
+  cursor: default;
+}

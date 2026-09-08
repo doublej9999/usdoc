@@ -312,7 +312,27 @@ def normalize_output_docx_filename(filename: str) -> str:
     return cleaned
 
 
-def extract_template_variables(template_path: Path) -> List[str]:
+_template_cache: Dict[str, tuple[float, List[str], List[str]]] = {}
+_template_cache_lock = Lock()
+
+
+def inspect_template_docx(template_path: Path) -> tuple[List[str], List[str]]:
+    """
+    解析模板 docx，提取有效变量与非法占位符。
+    具备基于文件 mtime 的内存缓存，避免批量生成时重复读取和解析相同模板。
+    """
+    path_resolved = str(template_path.resolve())
+    try:
+        mtime = template_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
+    with _template_cache_lock:
+        if path_resolved in _template_cache:
+            cached_mtime, vars_cached, invalids_cached = _template_cache[path_resolved]
+            if cached_mtime == mtime:
+                return list(vars_cached), list(invalids_cached)
+
     doc = Document(str(template_path))
     text_blocks = []
 
@@ -328,36 +348,31 @@ def extract_template_variables(template_path: Path) -> List[str]:
     full_text = "\n".join(text_blocks)
     vars_found = re.findall(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}", full_text)
 
-    ordered = []
+    ordered_vars = []
     for key in vars_found:
-        if key not in ordered:
-            ordered.append(key)
+        if key not in ordered_vars:
+            ordered_vars.append(key)
 
-    return ordered
-
-
-def extract_invalid_template_placeholders(template_path: Path) -> List[str]:
-    doc = Document(str(template_path))
-    text_blocks = []
-
-    for paragraph in doc.paragraphs:
-        text_blocks.append(paragraph.text)
-
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    text_blocks.append(paragraph.text)
-
-    full_text = "\n".join(text_blocks)
     all_placeholders = re.findall(r"{{\s*([^{}]+?)\s*}}", full_text)
-
     invalid = []
     for placeholder in all_placeholders:
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", placeholder):
             if placeholder not in invalid:
                 invalid.append(placeholder)
 
+    with _template_cache_lock:
+        _template_cache[path_resolved] = (mtime, ordered_vars, invalid)
+
+    return list(ordered_vars), list(invalid)
+
+
+def extract_template_variables(template_path: Path) -> List[str]:
+    variables, _ = inspect_template_docx(template_path)
+    return variables
+
+
+def extract_invalid_template_placeholders(template_path: Path) -> List[str]:
+    _, invalid = inspect_template_docx(template_path)
     return invalid
 
 
@@ -511,10 +526,18 @@ async def upload_template(file: UploadFile = File(...)):
     with open(save_path, "wb") as f:
         f.write(content)
 
+    # 尝试解析模板中的有效变量和非法占位符
+    try:
+        variables, invalid_placeholders = inspect_template_docx(save_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"模板解析失败: {str(exc)}")
+
     return JSONResponse(
         {
             "message": "模板上传成功",
             "template_name": filename,
+            "variables": variables,
+            "invalid_placeholders": invalid_placeholders,
         }
     )
 
@@ -526,7 +549,7 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
     if not template_path.exists():
         raise HTTPException(status_code=404, detail="模板不存在，请先上传模板")
 
-    invalid_placeholders = extract_invalid_template_placeholders(template_path)
+    variables, invalid_placeholders = inspect_template_docx(template_path)
     if invalid_placeholders:
         raise HTTPException(
             status_code=400,
@@ -535,7 +558,6 @@ def generate_common(req: GenerateRequest) -> Dict[str, str]:
             + "。请改为 {{story_acceptance_criteria}} 这类格式。",
         )
 
-    variables = extract_template_variables(template_path)
     if not variables:
         raise HTTPException(
             status_code=400,
@@ -574,7 +596,7 @@ def generate_default_docx(template_name: str, output_filename: str) -> str:
     if not template_path.exists():
         raise HTTPException(status_code=404, detail="模板不存在，请先上传模板")
 
-    invalid_placeholders = extract_invalid_template_placeholders(template_path)
+    variables, invalid_placeholders = inspect_template_docx(template_path)
     if invalid_placeholders:
         raise HTTPException(
             status_code=400,
@@ -583,7 +605,6 @@ def generate_default_docx(template_name: str, output_filename: str) -> str:
             + "。请改为 {{story_acceptance_criteria}} 这类格式。",
         )
 
-    variables = extract_template_variables(template_path)
     context = {k: "" for k in variables}
 
     docx_filename = normalize_output_docx_filename(output_filename)
@@ -598,21 +619,36 @@ def generate_default_docx(template_name: str, output_filename: str) -> str:
     return docx_filename
 
 
+def is_excel_column_letter(val: str) -> bool:
+    """
+    检查是否是合法的 Excel 纯列字母（1~3位英文字母，最大 XFD）。
+    """
+    s = (val or "").strip()
+    if not re.fullmatch(r"[A-Za-z]{1,3}", s):
+        return False
+    idx = 0
+    for ch in s.upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return 1 <= idx <= 16384
+
+
 def resolve_column_index(column: str, header_row: List[str]) -> int:
     value = (column or "").strip()
     if not value:
         raise HTTPException(status_code=400, detail="Excel 列不能为空")
 
-    if re.fullmatch(r"[A-Za-z]+", value):
-        idx = 0
-        for ch in value.upper():
-            idx = idx * 26 + (ord(ch) - ord("A") + 1)
-        return idx - 1
-
+    # 1. 优先检查 header_row 是否存在完全匹配（大小写不敏感）
     needle = value.lower()
     for i, name in enumerate(header_row):
         if str(name or "").strip().lower() == needle:
             return i
+
+    # 2. 如果表头没有匹配上，再判断是否为纯列字母表示（如 A, B, AA, AB）
+    if is_excel_column_letter(value):
+        idx = 0
+        for ch in value.upper():
+            idx = idx * 26 + (ord(ch) - ord("A") + 1)
+        return idx - 1
 
     raise HTTPException(status_code=400, detail=f"未找到列: {column}")
 
@@ -822,16 +858,26 @@ async def create_batch_task(
         if not rows:
             raise HTTPException(status_code=400, detail="Excel sheet 为空")
 
-        prompt_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (prompt_column or "").strip()))
-        filename_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (filename_column or "").strip()))
-        use_header = not (prompt_col_is_letter and filename_col_is_letter)
+        # 判断是否按表头模式解析：
+        # 如果第一行中有任意一个单元格能匹配到 prompt_column 或 filename_column（不区分大小写），
+        # 或者用户输入的不是合法的纯列字母（如 'prompt', 'title', '文件名'），则必须采用表头模式。
+        first_row_cells = [str(item or "").strip() for item in rows[0]] if rows else []
+        first_row_cells_lower = [c.lower() for c in first_row_cells]
+
+        prompt_in_header = (prompt_column or "").strip().lower() in first_row_cells_lower
+        filename_in_header = (filename_column or "").strip().lower() in first_row_cells_lower
+        prompt_is_letter = is_excel_column_letter(prompt_column)
+        filename_is_letter = is_excel_column_letter(filename_column)
+
+        # 只要有一项在第一行表头中存在，或者不符合纯列字母规则，就判定为表头模式（第一行为表头，数据从第二行起）
+        use_header = prompt_in_header or filename_in_header or (not prompt_is_letter) or (not filename_is_letter)
 
         if not use_header:
             prompt_col_index = resolve_column_index(prompt_column, [])
             filename_col_index = resolve_column_index(filename_column, [])
             data_rows = list(enumerate(rows, start=1))
         else:
-            header_row = [str(item or "").strip() for item in rows[0]]
+            header_row = first_row_cells
             prompt_col_index = resolve_column_index(prompt_column, header_row)
             filename_col_index = resolve_column_index(filename_column, header_row)
             data_rows = list(enumerate(rows[1:], start=2))
@@ -1020,16 +1066,23 @@ async def generate_docx_from_excel(
         if not rows:
             raise HTTPException(status_code=400, detail="Excel sheet 为空")
 
-        prompt_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (prompt_column or "").strip()))
-        filename_col_is_letter = bool(re.fullmatch(r"[A-Za-z]+", (filename_column or "").strip()))
-        use_header = not (prompt_col_is_letter and filename_col_is_letter)
+        # 判断是否按表头模式解析
+        first_row_cells = [str(item or "").strip() for item in rows[0]] if rows else []
+        first_row_cells_lower = [c.lower() for c in first_row_cells]
+
+        prompt_in_header = (prompt_column or "").strip().lower() in first_row_cells_lower
+        filename_in_header = (filename_column or "").strip().lower() in first_row_cells_lower
+        prompt_is_letter = is_excel_column_letter(prompt_column)
+        filename_is_letter = is_excel_column_letter(filename_column)
+
+        use_header = prompt_in_header or filename_in_header or (not prompt_is_letter) or (not filename_is_letter)
 
         if not use_header:
             prompt_col_index = resolve_column_index(prompt_column, [])
             filename_col_index = resolve_column_index(filename_column, [])
             data_rows = list(enumerate(rows, start=1))
         else:
-            header_row = [str(item or "").strip() for item in rows[0]]
+            header_row = first_row_cells
             prompt_col_index = resolve_column_index(prompt_column, header_row)
             filename_col_index = resolve_column_index(filename_column, header_row)
             data_rows = list(enumerate(rows[1:], start=2))

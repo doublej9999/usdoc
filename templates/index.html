@@ -19,6 +19,19 @@
       <input id="templateFile" type="file" accept=".docx" />
       <button id="uploadBtn" style="margin-top:12px;">上传模板</button>
       <div class="status" id="uploadStatus"></div>
+
+      <!-- 模板变量解析预览面板 -->
+      <div id="templateVarsBox" class="template-vars-box" style="display:none;">
+        <div class="template-vars-header">
+          <span>模板变量已提取（点击变量可插入提示词）：</span>
+          <span id="templateVarsCount" style="color:#64748b; font-size:12px;"></span>
+        </div>
+        <div id="templateVarsList" class="template-vars-list"></div>
+        <div id="templateInvalidBox" style="margin-top:8px; display:none;">
+          <div style="font-size:12px; color:#dc2626; font-weight:600; margin-bottom:4px;">发现非法占位符（请在模板中修正）：</div>
+          <div id="templateInvalidList" class="template-vars-list"></div>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -151,6 +164,12 @@
     const templateFile = document.getElementById('templateFile');
     const uploadBtn = document.getElementById('uploadBtn');
     const uploadStatus = document.getElementById('uploadStatus');
+    const templateVarsBox = document.getElementById('templateVarsBox');
+    const templateVarsCount = document.getElementById('templateVarsCount');
+    const templateVarsList = document.getElementById('templateVarsList');
+    const templateInvalidBox = document.getElementById('templateInvalidBox');
+    const templateInvalidList = document.getElementById('templateInvalidList');
+
     const actionStatus = document.getElementById('actionStatus');
     const downloadLinks = document.getElementById('downloadLinks');
     const promptInput = document.getElementById('prompt');
@@ -163,9 +182,72 @@
     const genDocxBtn = document.getElementById('genDocxBtn');
     const genPdfBtn = document.getElementById('genPdfBtn');
     const genFromExcelBtn = document.getElementById('genFromExcelBtn');
+    const apiUrlInput = document.getElementById('apiUrl');
+    const modelInput = document.getElementById('model');
+    const apiKeyInput = document.getElementById('apiKey');
+    const outputFilenameInput = document.getElementById('outputFilename');
 
     let recordsPollTimer = null;
     let uploadedTemplateName = '';
+
+    // 本地存储记忆项（优化 1）
+    const STORAGE_KEY_CONFIG = 'usdoc_config_prefs';
+
+    function loadSavedConfig() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY_CONFIG);
+        if (!raw) return;
+        const cfg = JSON.parse(raw);
+        if (cfg.apiUrl) apiUrlInput.value = cfg.apiUrl;
+        if (cfg.model) modelInput.value = cfg.model;
+        if (cfg.apiKey) apiKeyInput.value = cfg.apiKey;
+        if (cfg.sheetName) sheetNameInput.value = cfg.sheetName;
+        if (cfg.promptColumn) promptColumnNameInput.value = cfg.promptColumn;
+        if (cfg.filenameColumn) filenameColumnNameInput.value = cfg.filenameColumn;
+        if (cfg.outputPrefix) outputPrefixInput.value = cfg.outputPrefix;
+        if (cfg.concurrency && concurrencySelect) concurrencySelect.value = cfg.concurrency;
+      } catch (e) {
+        console.warn('读取本地配置失败:', e);
+      }
+    }
+
+    function saveCurrentConfig() {
+      try {
+        const cfg = {
+          apiUrl: apiUrlInput.value.trim(),
+          model: modelInput.value.trim(),
+          apiKey: apiKeyInput.value.trim(),
+          sheetName: sheetNameInput.value.trim(),
+          promptColumn: promptColumnNameInput.value.trim(),
+          filenameColumn: filenameColumnNameInput.value.trim(),
+          outputPrefix: outputPrefixInput.value.trim(),
+          concurrency: concurrencySelect ? concurrencySelect.value : '5'
+        };
+        localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(cfg));
+      } catch (e) {
+        console.warn('保存本地配置失败:', e);
+      }
+    }
+
+    // 监听关键表单变动自动持久化
+    [apiUrlInput, modelInput, apiKeyInput, sheetNameInput, promptColumnNameInput, filenameColumnNameInput, outputPrefixInput, concurrencySelect].forEach(el => {
+      if (el) {
+        el.addEventListener('input', saveCurrentConfig);
+        el.addEventListener('change', saveCurrentConfig);
+      }
+    });
+
+    // 辅助将变量快速插入提示词文本框光标处
+    function insertVariableToPrompt(varName) {
+      const placeholder = `{{${varName}}}`;
+      const start = promptInput.selectionStart;
+      const end = promptInput.selectionEnd;
+      const val = promptInput.value;
+      promptInput.value = val.substring(0, start) + placeholder + val.substring(end);
+      promptInput.focus();
+      promptInput.selectionStart = promptInput.selectionEnd = start + placeholder.length;
+      actionStatus.textContent = `已将变量 ${placeholder} 插入提示词`;
+    }
 
     function getPayload() {
       return {
@@ -301,6 +383,7 @@
       const formData = new FormData();
       formData.append('file', file);
       uploadStatus.textContent = '上传中...';
+      templateVarsBox.style.display = 'none';
 
       try {
         const res = await fetch('/upload-template', {
@@ -311,8 +394,43 @@
         if (!res.ok) throw new Error(data.detail || data.message || `上传失败 (HTTP ${res.status})`);
         uploadStatus.textContent = `上传成功：${data.template_name}`;
         uploadedTemplateName = data.template_name || '';
+
+        // 渲染变量列表与非法占位符（优化 4）
+        const vars = data.variables || [];
+        const invalids = data.invalid_placeholders || [];
+
+        templateVarsList.innerHTML = '';
+        if (vars.length > 0) {
+          templateVarsCount.textContent = `共 ${vars.length} 个变量`;
+          vars.forEach(v => {
+            const badge = document.createElement('span');
+            badge.className = 'var-badge';
+            badge.title = '点击插入到提示词';
+            badge.textContent = `+ {{${v}}}`;
+            badge.addEventListener('click', () => insertVariableToPrompt(v));
+            templateVarsList.appendChild(badge);
+          });
+        } else {
+          templateVarsCount.textContent = '未检测到 {{variable}} 变量';
+        }
+
+        if (invalids.length > 0) {
+          templateInvalidBox.style.display = 'block';
+          templateInvalidList.innerHTML = '';
+          invalids.forEach(inv => {
+            const badge = document.createElement('span');
+            badge.className = 'var-badge var-badge-invalid';
+            badge.textContent = `{{${inv}}}`;
+            templateInvalidList.appendChild(badge);
+          });
+        } else {
+          templateInvalidBox.style.display = 'none';
+        }
+
+        templateVarsBox.style.display = 'block';
       } catch (err) {
         uploadStatus.textContent = `上传失败：${err.message}`;
+        templateVarsBox.style.display = 'none';
       }
     }
 
@@ -591,6 +709,7 @@
     genFromExcelBtn.addEventListener('click', generateFromExcel);
 
     loadRecords();
+    loadSavedConfig();
     startPollingRecords();
   </script>
 </body>
