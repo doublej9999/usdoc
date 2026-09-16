@@ -1,12 +1,21 @@
 .venv/
 __pycache__/
+.pytest_cache/
 *.pyc
+
+# Logs
+*.log
+server.out.log
+server.err.log
+
+# Uploads & Outputs
 uploads/
 outputs/
+
+# Project specific / build
 mock_openai.py
 .idea/
 build/
 dist/
-*.log
 ~$*.docx
 generation_records.json

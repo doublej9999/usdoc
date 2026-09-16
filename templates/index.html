@@ -14,18 +14,34 @@
     </div>
 
     <div class="card">
-      <h2>模板上传区</h2>
-      <label for="templateFile">上传 .docx 模板</label>
-      <input id="templateFile" type="file" accept=".docx" />
-      <button id="uploadBtn" style="margin-top:12px;">上传模板</button>
+      <h2>模板选择与上传</h2>
+      <div class="template-select-group">
+        <label for="templateSelect">选择已有模板</label>
+        <select id="templateSelect">
+          <option value="">-- 加载模板列表中... --</option>
+        </select>
+      </div>
+
+      <div style="margin-top:14px;">
+        <label for="templateFile">或上传新 .docx 模板</label>
+        <div class="template-upload-row">
+          <input id="templateFile" type="file" accept=".docx" />
+          <button id="uploadBtn">上传模板</button>
+        </div>
+      </div>
       <div class="status" id="uploadStatus"></div>
+
+      <div id="templateVariablesContainer" class="template-variables-container" style="display: none;">
+        <div class="template-variables-title">检测到的模板变量字段：</div>
+        <div id="templateVariables"></div>
+      </div>
     </div>
 
     <div class="card">
       <h2>提示词输入区</h2>
       <label for="prompt">提示词</label>
       <textarea id="prompt" placeholder="例如：帮我写一份美国公司注册方案，预算500美元"></textarea>
-      <p class="status">批量导入时支持占位符：<code>{{excel_value}}</code> 或 <code>{excel_value}</code>。若留空提示词，则直接使用 Excel 指定列内容作为提示词。</p>
+      <p class="status">批量导入时支持占位符：{% raw %}<code>{{excel_value}}</code>{% endraw %} 或 <code>{excel_value}</code>。若留空提示词，则直接使用 Excel 指定列内容作为提示词。</p>
     </div>
 
     <div class="card">
@@ -68,6 +84,11 @@
         <label for="apiKey">API Key</label>
         <input id="apiKey" type="password" placeholder="sk-xxxx" />
       </div>
+      <div class="config-actions">
+        <button id="saveConfigBtn" class="btn-sm">保存配置</button>
+        <button id="clearConfigBtn" class="btn-sm btn-secondary">清除配置</button>
+        <span id="configStatus" class="config-status"></span>
+      </div>
       <div style="margin-top:12px;">
         <label for="outputFilename">生成文件名称（支持自定义）</label>
         <input id="outputFilename" type="text" placeholder="例如：my_output.docx（可不填）" />
@@ -86,45 +107,80 @@
     </div>
 
     <div class="card">
-      <h2>生成记录</h2>
+      <div class="card-header-flex">
+        <h2>生成记录</h2>
+        <button id="clearRecordsBtn" class="btn-sm btn-danger">清空记录</button>
+      </div>
       <p class="status">每次点击“生成 Word”都会自动新增记录，后台完成后可直接下载。</p>
       <div id="recordsList" class="record-list"></div>
     </div>
   </div>
 
+  {% raw %}
   <script>
+    const templateSelect = document.getElementById('templateSelect');
     const templateFile = document.getElementById('templateFile');
     const uploadBtn = document.getElementById('uploadBtn');
     const uploadStatus = document.getElementById('uploadStatus');
-    const actionStatus = document.getElementById('actionStatus');
-    const downloadLinks = document.getElementById('downloadLinks');
+    const templateVariablesContainer = document.getElementById('templateVariablesContainer');
+    const templateVariables = document.getElementById('templateVariables');
+
     const promptInput = document.getElementById('prompt');
-    const recordsList = document.getElementById('recordsList');
+
     const excelFileInput = document.getElementById('excelFile');
     const sheetNameInput = document.getElementById('sheetName');
     const promptColumnNameInput = document.getElementById('promptColumnName');
     const filenameColumnNameInput = document.getElementById('filenameColumnName');
     const outputPrefixInput = document.getElementById('outputPrefix');
+
+    const apiUrlInput = document.getElementById('apiUrl');
+    const modelInput = document.getElementById('model');
+    const apiKeyInput = document.getElementById('apiKey');
+    const saveConfigBtn = document.getElementById('saveConfigBtn');
+    const clearConfigBtn = document.getElementById('clearConfigBtn');
+    const configStatus = document.getElementById('configStatus');
+    const outputFilenameInput = document.getElementById('outputFilename');
+
     const genDocxBtn = document.getElementById('genDocxBtn');
     const genPdfBtn = document.getElementById('genPdfBtn');
     const genFromExcelBtn = document.getElementById('genFromExcelBtn');
+    const actionStatus = document.getElementById('actionStatus');
+    const downloadLinks = document.getElementById('downloadLinks');
+
+    const clearRecordsBtn = document.getElementById('clearRecordsBtn');
+    const recordsList = document.getElementById('recordsList');
+
+    const STORAGE_KEY_API_URL = 'usdoc_api_url';
+    const STORAGE_KEY_MODEL = 'usdoc_model';
+    const STORAGE_KEY_API_KEY = 'usdoc_api_key';
+    const STORAGE_KEY_SELECTED_TEMPLATE = 'usdoc_selected_template';
 
     let recordsPollTimer = null;
     let uploadedTemplateName = '';
 
-    function getPayload() {
-      return {
-        prompt: promptInput.value.trim(),
-        api_url: document.getElementById('apiUrl').value.trim(),
-        api_key: document.getElementById('apiKey').value.trim(),
-        model: document.getElementById('model').value.trim(),
-        template_name: uploadedTemplateName,
-        output_filename: document.getElementById('outputFilename').value.trim()
-      };
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
     }
 
-    function validatePayload(payload) {
-      return payload.prompt && payload.api_url && payload.api_key && payload.model && payload.template_name;
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function formatTime(value) {
+      if (!value) return '-';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return value;
+      return d.toLocaleString();
     }
 
     async function parseResponseData(res) {
@@ -137,11 +193,397 @@
       }
     }
 
-    function formatTime(value) {
-      if (!value) return '-';
-      const d = new Date(value);
-      if (Number.isNaN(d.getTime())) return value;
-      return d.toLocaleString();
+    function loadConfig() {
+      const savedUrl = localStorage.getItem(STORAGE_KEY_API_URL);
+      const savedModel = localStorage.getItem(STORAGE_KEY_MODEL);
+      const savedKey = localStorage.getItem(STORAGE_KEY_API_KEY);
+
+      if (savedUrl !== null) apiUrlInput.value = savedUrl;
+      if (savedModel !== null) modelInput.value = savedModel;
+      if (savedKey !== null) apiKeyInput.value = savedKey;
+    }
+
+    function saveConfig(showFeedback = true) {
+      localStorage.setItem(STORAGE_KEY_API_URL, apiUrlInput.value.trim());
+      localStorage.setItem(STORAGE_KEY_MODEL, modelInput.value.trim());
+      localStorage.setItem(STORAGE_KEY_API_KEY, apiKeyInput.value.trim());
+
+      if (showFeedback) {
+        configStatus.textContent = '✓ 配置已保存';
+        setTimeout(() => {
+          if (configStatus.textContent === '✓ 配置已保存') {
+            configStatus.textContent = '';
+          }
+        }, 2500);
+      }
+    }
+
+    function clearConfig() {
+      localStorage.removeItem(STORAGE_KEY_API_URL);
+      localStorage.removeItem(STORAGE_KEY_MODEL);
+      localStorage.removeItem(STORAGE_KEY_API_KEY);
+
+      apiUrlInput.value = 'https://ai.927900.xyz/v1/chat/completions';
+      modelInput.value = 'gpt-5.4';
+      apiKeyInput.value = '';
+
+      configStatus.textContent = '✓ 配置已清除并恢复默认';
+      setTimeout(() => {
+        if (configStatus.textContent === '✓ 配置已清除并恢复默认') {
+          configStatus.textContent = '';
+        }
+      }, 2500);
+    }
+
+    function renderTemplateVariables(variables, errorMessage) {
+      templateVariables.innerHTML = '';
+
+      if (errorMessage) {
+        templateVariablesContainer.style.display = 'block';
+        const span = document.createElement('span');
+        span.className = 'var-badge-empty';
+        span.textContent = `⚠️ ${errorMessage}`;
+        templateVariables.appendChild(span);
+        return;
+      }
+
+      if (!variables || variables.length === 0) {
+        if (!uploadedTemplateName) {
+          templateVariablesContainer.style.display = 'none';
+          return;
+        }
+        templateVariablesContainer.style.display = 'block';
+        const span = document.createElement('span');
+        span.className = 'var-badge-empty';
+        span.textContent = '未在模板中检测到变量占位符 ({{变量名}})';
+        templateVariables.appendChild(span);
+        return;
+      }
+
+      templateVariablesContainer.style.display = 'block';
+      variables.forEach((v) => {
+        const badge = document.createElement('span');
+        badge.className = 'var-badge';
+        badge.textContent = `{{${v}}}`;
+        badge.title = `点击将 {{${v}}} 插入提示词`;
+        badge.addEventListener('click', () => {
+          const pos = promptInput.selectionStart || promptInput.value.length;
+          const text = promptInput.value;
+          const tag = `{{${v}}}`;
+          promptInput.value = text.slice(0, pos) + tag + text.slice(pos);
+          promptInput.focus();
+          promptInput.setSelectionRange(pos + tag.length, pos + tag.length);
+
+          actionStatus.textContent = `已将变量 {{${v}}} 插入提示词`;
+          setTimeout(() => {
+            if (actionStatus.textContent.includes('已将变量')) actionStatus.textContent = '';
+          }, 2000);
+        });
+        templateVariables.appendChild(badge);
+      });
+    }
+
+    async function fetchTemplateVariables(templateName) {
+      if (!templateName) {
+        renderTemplateVariables([]);
+        return;
+      }
+      try {
+        const res = await fetch(`/templates/${encodeURIComponent(templateName)}/variables`);
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        renderTemplateVariables(data.variables || []);
+      } catch (err) {
+        renderTemplateVariables([], `获取变量失败: ${err.message}`);
+      }
+    }
+
+    async function loadTemplates(preferredName) {
+      try {
+        const res = await fetch('/templates');
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+        const templates = data.templates || [];
+        templateSelect.innerHTML = '';
+
+        if (templates.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = '-- 暂无可用模板，请在下方上传 --';
+          templateSelect.appendChild(opt);
+          uploadedTemplateName = '';
+          renderTemplateVariables([]);
+          return;
+        }
+
+        const defaultOpt = document.createElement('option');
+        defaultOpt.value = '';
+        defaultOpt.textContent = '-- 请选择已有模板 --';
+        templateSelect.appendChild(defaultOpt);
+
+        let target = preferredName || uploadedTemplateName || localStorage.getItem(STORAGE_KEY_SELECTED_TEMPLATE) || '';
+        let matched = false;
+
+        templates.forEach((tpl) => {
+          const opt = document.createElement('option');
+          opt.value = tpl.name;
+          opt.textContent = `${tpl.name}${tpl.size ? ' (' + formatBytes(tpl.size) + ')' : ''}`;
+          if (target && tpl.name === target) {
+            opt.selected = true;
+            matched = true;
+          }
+          templateSelect.appendChild(opt);
+        });
+
+        if (!matched) {
+          const usDocx = templates.find((t) => t.name.toLowerCase() === 'us.docx');
+          if (usDocx) {
+            templateSelect.value = usDocx.name;
+            matched = true;
+          } else if (templates.length > 0) {
+            templateSelect.value = templates[0].name;
+            matched = true;
+          }
+        }
+
+        if (matched && templateSelect.value) {
+          uploadedTemplateName = templateSelect.value;
+          localStorage.setItem(STORAGE_KEY_SELECTED_TEMPLATE, uploadedTemplateName);
+          uploadStatus.textContent = `当前选用模板：${uploadedTemplateName}`;
+          await fetchTemplateVariables(uploadedTemplateName);
+        } else {
+          uploadedTemplateName = '';
+          renderTemplateVariables([]);
+        }
+      } catch (err) {
+        templateSelect.innerHTML = '<option value="">-- 加载模板失败 --</option>';
+        uploadStatus.textContent = `模板列表加载失败: ${err.message}`;
+      }
+    }
+
+    templateSelect.addEventListener('change', async () => {
+      const val = templateSelect.value;
+      uploadedTemplateName = val;
+      if (val) {
+        localStorage.setItem(STORAGE_KEY_SELECTED_TEMPLATE, val);
+        uploadStatus.textContent = `当前选用模板：${val}`;
+        await fetchTemplateVariables(val);
+      } else {
+        localStorage.removeItem(STORAGE_KEY_SELECTED_TEMPLATE);
+        uploadStatus.textContent = '';
+        renderTemplateVariables([]);
+      }
+    });
+
+    async function uploadTemplate() {
+      const file = templateFile.files[0];
+      if (!file) {
+        uploadStatus.textContent = '请选择一个 .docx 模板文件';
+        return;
+      }
+      if (!file.name.toLowerCase().endsWith('.docx')) {
+        uploadStatus.textContent = '只支持上传 .docx 格式模板文件';
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', file);
+      uploadStatus.textContent = '上传中...';
+      uploadBtn.disabled = true;
+
+      try {
+        const res = await fetch('/upload-template', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `上传失败 (HTTP ${res.status})`);
+        const newName = data.template_name || file.name;
+        uploadedTemplateName = newName;
+        localStorage.setItem(STORAGE_KEY_SELECTED_TEMPLATE, newName);
+        templateFile.value = '';
+        uploadStatus.textContent = `上传成功：${newName}`;
+        await loadTemplates(newName);
+        await fetchTemplateVariables(newName);
+      } catch (err) {
+        uploadStatus.textContent = `上传失败：${err.message}`;
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    }
+
+    function getPayload() {
+      const selectedTemplate = uploadedTemplateName || templateSelect.value;
+      return {
+        prompt: promptInput.value.trim(),
+        api_url: apiUrlInput.value.trim(),
+        api_key: apiKeyInput.value.trim(),
+        model: modelInput.value.trim(),
+        template_name: selectedTemplate,
+        output_filename: outputFilenameInput.value.trim()
+      };
+    }
+
+    function validatePayload(payload) {
+      if (!payload.template_name) {
+        actionStatus.textContent = '请先选择或上传 .docx 模板。';
+        return false;
+      }
+      if (!payload.prompt) {
+        actionStatus.textContent = '请输入提示词。';
+        return false;
+      }
+      if (!payload.api_url || !payload.api_key || !payload.model) {
+        actionStatus.textContent = '请完整填写 AI 配置（API URL、Model、API Key）。';
+        return false;
+      }
+      return true;
+    }
+
+    async function generateDocxInBackground() {
+      const payload = getPayload();
+      if (!validatePayload(payload)) return;
+
+      actionStatus.textContent = '任务已提交，后台正在生成 Word...';
+      genDocxBtn.disabled = true;
+
+      try {
+        const res = await fetch('/generate-docx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
+        actionStatus.textContent = data.message || 'Word 已提交后台生成';
+        await loadRecords();
+      } catch (err) {
+        actionStatus.textContent = `生成失败：${err.message}`;
+      } finally {
+        genDocxBtn.disabled = false;
+      }
+    }
+
+    async function generatePdf() {
+      const payload = getPayload();
+      if (!validatePayload(payload)) return;
+
+      actionStatus.textContent = '正在生成 PDF，请稍候...';
+      downloadLinks.innerHTML = '';
+      genPdfBtn.disabled = true;
+
+      try {
+        const res = await fetch('/generate-pdf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
+
+        actionStatus.textContent = data.message || 'PDF 生成成功';
+        if (data.download_url) {
+          const link = document.createElement('a');
+          link.href = data.download_url;
+          link.target = '_blank';
+          link.className = 'download-link-btn';
+          link.textContent = `📄 下载生成文件：${data.filename || 'PDF'}`;
+          downloadLinks.innerHTML = '';
+          downloadLinks.appendChild(link);
+        }
+      } catch (err) {
+        actionStatus.textContent = `生成失败：${err.message}`;
+      } finally {
+        genPdfBtn.disabled = false;
+      }
+    }
+
+    async function generateFromExcel() {
+      const selectedTemplate = uploadedTemplateName || templateSelect.value;
+      if (!selectedTemplate) {
+        actionStatus.textContent = '请先选择或上传 .docx 模板。';
+        return;
+      }
+      if (!excelFileInput.files[0]) {
+        actionStatus.textContent = '请先选择 .xlsx 文件。';
+        return;
+      }
+      const payload = getPayload();
+      if (!payload.api_url || !payload.api_key || !payload.model) {
+        actionStatus.textContent = '请完整填写 AI 配置（API URL、Model、API Key）。';
+        return;
+      }
+      const promptColumn = (promptColumnNameInput.value || '').trim();
+      const filenameColumn = (filenameColumnNameInput.value || '').trim();
+      if (!promptColumn || !filenameColumn) {
+        actionStatus.textContent = '请填写提示词列和文件名列（例如 A/B 或列标题）。';
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('file', excelFileInput.files[0]);
+      formData.append('prompt', payload.prompt);
+      formData.append('api_url', payload.api_url);
+      formData.append('api_key', payload.api_key);
+      formData.append('model', payload.model);
+      formData.append('template_name', selectedTemplate);
+      formData.append('sheet_name', (sheetNameInput.value || 'Sheet1').trim() || 'Sheet1');
+      formData.append('prompt_column', promptColumn);
+      formData.append('filename_column', filenameColumn);
+      formData.append('output_prefix', (outputPrefixInput.value || 'excel_generated').trim() || 'excel_generated');
+
+      downloadLinks.innerHTML = '';
+      genFromExcelBtn.disabled = true;
+      genDocxBtn.disabled = true;
+      genPdfBtn.disabled = true;
+
+      const startTime = Date.now();
+      const fileName = excelFileInput.files[0].name;
+
+      const renderProgress = () => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        actionStatus.innerHTML = `
+          <div class="progress-box">
+            <div class="progress-title">⚡ Excel 批量生成进行中... (已用时 ${elapsed} 秒)</div>
+            <div class="progress-bar-bg"><div class="progress-bar-inner"></div></div>
+            <div class="progress-desc">文件：${escapeHtml(fileName)} | 正在并发调用 AI 模型生成各行文档并打包，请耐心等待...</div>
+          </div>
+        `;
+      };
+
+      renderProgress();
+      const timerId = setInterval(renderProgress, 1000);
+
+      try {
+        const res = await fetch('/generate-docx-from-excel', {
+          method: 'POST',
+          body: formData
+        });
+        clearInterval(timerId);
+        const data = await parseResponseData(res);
+        if (!res.ok) throw new Error(data.detail || data.message || `批量生成失败 (HTTP ${res.status})`);
+
+        const totalTime = Math.floor((Date.now() - startTime) / 1000);
+        actionStatus.innerHTML = `<span style="color: #166534; font-weight: 600;">✓ ${escapeHtml(data.message || '批量生成成功')} (共耗时 ${totalTime} 秒)</span>`;
+        if (data.download_url) {
+          const link = document.createElement('a');
+          link.href = data.download_url;
+          link.target = '_blank';
+          link.className = 'download-link-btn';
+          link.textContent = `📦 下载打包文件：${data.zip_filename || 'generated.zip'}`;
+          downloadLinks.innerHTML = '';
+          downloadLinks.appendChild(link);
+        }
+        await loadRecords();
+      } catch (err) {
+        clearInterval(timerId);
+        actionStatus.innerHTML = `<span style="color: #991b1b; font-weight: 600;">✕ 批量生成失败：${escapeHtml(err.message)}</span>`;
+      } finally {
+        genFromExcelBtn.disabled = false;
+        genDocxBtn.disabled = false;
+        genPdfBtn.disabled = false;
+      }
     }
 
     function getStatusMeta(status) {
@@ -156,10 +598,13 @@
       if (!records || records.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'record-empty';
-        empty.textContent = '暂无记录';
+        empty.textContent = '暂无生成记录';
         recordsList.appendChild(empty);
+        if (clearRecordsBtn) clearRecordsBtn.disabled = true;
         return;
       }
+
+      if (clearRecordsBtn) clearRecordsBtn.disabled = false;
 
       records.forEach((record) => {
         const meta = getStatusMeta(record.status);
@@ -204,8 +649,28 @@
           actionStatus.textContent = '已将该条记录的提示词回填到输入区，请点击“生成 Word”重新生成。';
         });
 
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'tiny-btn danger';
+        deleteBtn.textContent = '删除';
+        deleteBtn.addEventListener('click', async () => {
+          if (!confirm('确定删除此条记录吗？')) return;
+          deleteBtn.disabled = true;
+          try {
+            const res = await fetch(`/generation-records/${encodeURIComponent(record.id)}`, {
+              method: 'DELETE'
+            });
+            const data = await parseResponseData(res);
+            if (!res.ok) throw new Error(data.detail || data.message || `删除失败 (HTTP ${res.status})`);
+            await loadRecords();
+          } catch (err) {
+            alert(`删除记录失败：${err.message}`);
+            deleteBtn.disabled = false;
+          }
+        });
+
         actions.appendChild(downloadBtn);
         actions.appendChild(regenerateBtn);
+        actions.appendChild(deleteBtn);
 
         item.appendChild(top);
         item.appendChild(actions);
@@ -223,7 +688,7 @@
 
     async function loadRecords() {
       try {
-        const res = await fetch('/generation-records?limit=30');
+        const res = await fetch('/generation-records?limit=50');
         const data = await parseResponseData(res);
         if (!res.ok) throw new Error(data.detail || `加载记录失败 (HTTP ${res.status})`);
         renderRecords(data.records || []);
@@ -236,166 +701,48 @@
       }
     }
 
-    async function uploadTemplate() {
-      const file = templateFile.files[0];
-      if (!file) {
-        uploadStatus.textContent = '请选择一个 .docx 模板文件';
-        return;
-      }
-
-      const formData = new FormData();
-      formData.append('file', file);
-      uploadStatus.textContent = '上传中...';
-
+    async function clearAllRecords() {
+      if (!confirm('确定要清空所有生成记录吗？清空后不可恢复。')) return;
+      clearRecordsBtn.disabled = true;
       try {
-        const res = await fetch('/upload-template', {
-          method: 'POST',
-          body: formData
-        });
+        const res = await fetch('/generation-records', { method: 'DELETE' });
         const data = await parseResponseData(res);
-        if (!res.ok) throw new Error(data.detail || data.message || `上传失败 (HTTP ${res.status})`);
-        uploadStatus.textContent = `上传成功：${data.template_name}`;
-        uploadedTemplateName = data.template_name || '';
-      } catch (err) {
-        uploadStatus.textContent = `上传失败：${err.message}`;
-      }
-    }
-
-    async function generateDocxInBackground() {
-      const payload = getPayload();
-      if (!validatePayload(payload)) {
-        actionStatus.textContent = '请完整填写提示词、AI 配置，并先上传模板。';
-        return;
-      }
-
-      actionStatus.textContent = '任务已提交，后台正在生成 Word...';
-      genDocxBtn.disabled = true;
-
-      try {
-        const res = await fetch('/generate-docx', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        const data = await parseResponseData(res);
-        if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
-        actionStatus.textContent = data.message || 'Word 已提交后台生成';
+        if (!res.ok) throw new Error(data.detail || data.message || `清空失败 (HTTP ${res.status})`);
+        actionStatus.textContent = '已清空所有生成记录';
         await loadRecords();
       } catch (err) {
-        actionStatus.textContent = `生成失败：${err.message}`;
+        alert(`清空记录失败：${err.message}`);
       } finally {
-        genDocxBtn.disabled = false;
+        clearRecordsBtn.disabled = false;
       }
     }
 
-    async function generatePdf() {
-      const payload = getPayload();
-      if (!validatePayload(payload)) {
-        actionStatus.textContent = '请完整填写提示词、AI 配置，并先上传模板。';
-        return;
-      }
+    // Config persistence listeners
+    apiUrlInput.addEventListener('input', () => saveConfig(false));
+    modelInput.addEventListener('input', () => saveConfig(false));
+    apiKeyInput.addEventListener('input', () => saveConfig(false));
+    saveConfigBtn.addEventListener('click', () => saveConfig(true));
+    clearConfigBtn.addEventListener('click', clearConfig);
 
-      actionStatus.textContent = '正在生成 PDF，请稍候...';
-      downloadLinks.innerHTML = '';
-      genPdfBtn.disabled = true;
+    // Template upload & Actions
+    uploadBtn.addEventListener('click', uploadTemplate);
+    genDocxBtn.addEventListener('click', generateDocxInBackground);
+    genPdfBtn.addEventListener('click', generatePdf);
+    genFromExcelBtn.addEventListener('click', generateFromExcel);
+    clearRecordsBtn.addEventListener('click', clearAllRecords);
 
-      try {
-        const res = await fetch('/generate-pdf', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        const data = await parseResponseData(res);
-        if (!res.ok) throw new Error(data.detail || data.message || `生成失败 (HTTP ${res.status})`);
-
-        actionStatus.textContent = data.message || 'PDF 生成成功';
-        if (data.download_url) {
-          const link = document.createElement('a');
-          link.href = data.download_url;
-          link.target = '_blank';
-          link.textContent = `下载文件：${data.filename || 'PDF'}`;
-          downloadLinks.innerHTML = '';
-          downloadLinks.appendChild(link);
-        }
-      } catch (err) {
-        actionStatus.textContent = `生成失败：${err.message}`;
-      } finally {
-        genPdfBtn.disabled = false;
-      }
-    }
-
-    async function generateFromExcel() {
-      if (!uploadedTemplateName) {
-        actionStatus.textContent = '请先上传模板。';
-        return;
-      }
-      if (!excelFileInput.files[0]) {
-        actionStatus.textContent = '请先选择 .xlsx 文件。';
-        return;
-      }
-      const payload = getPayload();
-      if (!payload.api_url || !payload.api_key || !payload.model) {
-        actionStatus.textContent = '请完整填写 AI 配置。';
-        return;
-      }
-      const promptColumn = (promptColumnNameInput.value || '').trim();
-      const filenameColumn = (filenameColumnNameInput.value || '').trim();
-      if (!promptColumn || !filenameColumn) {
-        actionStatus.textContent = '请填写提示词列和文件名列（例如 A/B 或列标题）。';
-        return;
-      }
-
-      const formData = new FormData();
-      formData.append('file', excelFileInput.files[0]);
-      formData.append('prompt', payload.prompt);
-      formData.append('api_url', payload.api_url);
-      formData.append('api_key', payload.api_key);
-      formData.append('model', payload.model);
-      formData.append('template_name', uploadedTemplateName);
-      formData.append('sheet_name', (sheetNameInput.value || 'Sheet1').trim() || 'Sheet1');
-      formData.append('prompt_column', promptColumn);
-      formData.append('filename_column', filenameColumn);
-      formData.append('output_prefix', (outputPrefixInput.value || 'excel_generated').trim() || 'excel_generated');
-
-      actionStatus.textContent = '正在按 Excel 批量生成 Word，请稍候...';
-      downloadLinks.innerHTML = '';
-      genFromExcelBtn.disabled = true;
-
-      try {
-        const res = await fetch('/generate-docx-from-excel', {
-          method: 'POST',
-          body: formData
-        });
-        const data = await parseResponseData(res);
-        if (!res.ok) throw new Error(data.detail || data.message || `批量生成失败 (HTTP ${res.status})`);
-
-        actionStatus.textContent = data.message || '批量生成成功';
-        if (data.download_url) {
-          const link = document.createElement('a');
-          link.href = data.download_url;
-          link.target = '_blank';
-          link.textContent = `下载打包文件：${data.zip_filename || 'generated.zip'}`;
-          downloadLinks.appendChild(link);
-        }
-      } catch (err) {
-        actionStatus.textContent = `批量生成失败：${err.message}`;
-      } finally {
-        genFromExcelBtn.disabled = false;
-      }
-    }
-
+    // Records polling
     function startPollingRecords() {
       if (recordsPollTimer) clearInterval(recordsPollTimer);
       recordsPollTimer = setInterval(loadRecords, 3000);
     }
 
-    uploadBtn.addEventListener('click', uploadTemplate);
-    genDocxBtn.addEventListener('click', generateDocxInBackground);
-    genPdfBtn.addEventListener('click', generatePdf);
-    genFromExcelBtn.addEventListener('click', generateFromExcel);
-
+    // Page initialization
+    loadConfig();
+    loadTemplates();
     loadRecords();
     startPollingRecords();
   </script>
+  {% endraw %}
 </body>
 </html>
