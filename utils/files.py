@@ -38,12 +38,39 @@ def build_default_docx_filename() -> str:
     return f"generated_{now}_{uid}.docx"
 
 
+def reserve_output_path(output_dir: Path, filename: str) -> Path:
+    """Atomically claim ``filename`` inside ``output_dir``.
+
+    The placeholder file is created with ``O_EXCL`` so two concurrent jobs that
+    request the same name can never be handed the same path. Callers write the
+    real document over the placeholder (or drop it via :func:`discard_output_path`).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(filename).stem or "document"
+    suffix = Path(filename).suffix or ".docx"
+
+    for attempt in range(10):
+        candidate = filename if attempt == 0 else f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+        path = output_dir / candidate
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.close(descriptor)
+        return path
+
+    raise RuntimeError(f"无法为 {filename} 分配唯一输出路径")
+
+
+def discard_output_path(path: Path) -> None:
+    """Release a path previously claimed by :func:`reserve_output_path`."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def ensure_unique_docx_path(output_dir: Path, requested_filename: str) -> tuple[str, Path]:
     docx_filename = normalize_output_docx_filename(requested_filename)
-    docx_path = output_dir / docx_filename
-    if docx_path.exists():
-        uid = uuid.uuid4().hex[:8]
-        stem = Path(docx_filename).stem
-        docx_filename = f"{stem}_{uid}.docx"
-        docx_path = output_dir / docx_filename
-    return docx_filename, docx_path
+    docx_path = reserve_output_path(output_dir, docx_filename)
+    return docx_path.name, docx_path

@@ -1,66 +1,48 @@
 # -*- coding: utf-8 -*-
-import sys
-from pathlib import Path
-
-# Ensure project root is in sys.path when running standalone
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+import main
 import pytest
 from docx import Document
-from utils.templates import extract_template_variables, extract_invalid_template_placeholders
+
+from utils.templates import extract_invalid_template_placeholders, extract_template_variables
+
+US_TEMPLATE = main.BASE_DIR / "US.docx"
 
 
 def test_extract_template_variables_on_us_docx():
-    template_path = PROJECT_ROOT / "US.docx"
-    assert template_path.exists(), f"Template not found at {template_path}"
-
-    variables = extract_template_variables(template_path)
-    assert isinstance(variables, list)
-    assert len(variables) > 0
-
-    expected_vars = [
-        "story_id",
-        "story_title",
-        "story_description",
-        "story_acceptance_criteria",
-    ]
-    for var in expected_vars:
-        assert var in variables, f"Expected variable '{var}' not found in {variables}"
+    variables = extract_template_variables(US_TEMPLATE)
+    assert "story_id" in variables
+    assert "story_title" in variables
+    assert "story_description" in variables
+    assert "story_acceptance_criteria" in variables
 
 
-def test_extract_invalid_template_placeholders_clean_template():
-    template_path = PROJECT_ROOT / "US.docx"
-    assert template_path.exists(), f"Template not found at {template_path}"
-
-    invalid = extract_invalid_template_placeholders(template_path)
-    assert invalid == []
+def test_us_docx_has_no_invalid_placeholders():
+    assert extract_invalid_template_placeholders(US_TEMPLATE) == []
 
 
-def test_extract_invalid_template_placeholders_with_invalid_tags(tmp_path: Path):
+def test_invalid_placeholders_are_reported(tmp_path):
     doc = Document()
     doc.add_paragraph("Hello {{ valid_var }} and {{ 123invalid }} and {{ bad-identifier }}")
-    temp_docx = tmp_path / "test_invalid.docx"
-    doc.save(str(temp_docx))
+    target = tmp_path / "invalid.docx"
+    doc.save(str(target))
 
-    invalid = extract_invalid_template_placeholders(temp_docx)
-    assert "123invalid" in invalid or "bad-identifier" in invalid
+    invalid = extract_invalid_template_placeholders(target)
+    assert "123invalid" in invalid
+    assert "bad-identifier" in invalid
+    assert "valid_var" not in invalid
 
-def test_generate_default_document(tmp_path: Path):
+
+def test_generate_default_document_renders_blank_template(tmp_path):
     from services.document_service import generate_default_document
-    from config import UPLOAD_DIR
 
-    output_name = "test_default_gen.docx"
-    generated_file = generate_default_document(
+    generated = generate_default_document(
         template_name="US.docx",
-        output_filename=output_name,
-        upload_dir=UPLOAD_DIR,
+        output_filename="blank.docx",
+        upload_dir=main.UPLOAD_DIR,
         output_dir=tmp_path,
     )
-    assert generated_file == output_name
-    assert (tmp_path / output_name).exists()
-
+    assert generated == "blank.docx"
+    assert (tmp_path / "blank.docx").exists()
 
 
 if __name__ == "__main__":

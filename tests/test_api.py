@@ -1,16 +1,9 @@
 # -*- coding: utf-8 -*-
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+import main
 import pytest
 from fastapi.testclient import TestClient
-from main import app
 
-client = TestClient(app)
+client = TestClient(main.app)
 
 
 def test_index_route():
@@ -23,10 +16,8 @@ def test_list_templates_route():
     response = client.get("/templates")
     assert response.status_code == 200
     data = response.json()
-    assert "templates" in data
     assert isinstance(data["templates"], list)
-    template_names = [t["name"] for t in data["templates"]]
-    assert "US.docx" in template_names
+    assert "US.docx" in [item["name"] for item in data["templates"]]
 
 
 def test_template_variables_route():
@@ -34,34 +25,91 @@ def test_template_variables_route():
     assert response.status_code == 200
     data = response.json()
     assert data["template_name"] == "US.docx"
-    assert "variables" in data
     assert "story_title" in data["variables"]
 
 
-def test_generation_records_crud():
-    # List records
+def test_generation_records_start_empty_and_list():
     response = client.get("/generation-records")
     assert response.status_code == 200
-    assert "records" in response.json()
-
-    # Clear records
-    clear_resp = client.delete("/generation-records")
-    assert clear_resp.status_code == 200
-
-    # List again -> empty
-    response_after = client.get("/generation-records")
-    assert response_after.status_code == 200
-    assert response_after.json()["records"] == []
+    assert response.json()["records"] == []
 
 
-def test_download_chinese_filename(tmp_path: Path):
-    from config import OUTPUT_DIR
-    chinese_file = OUTPUT_DIR / "测试_中文文档.docx"
-    chinese_file.write_bytes(b"dummy docx content")
+def test_generation_record_delete_missing_returns_404():
+    response = client.delete("/generation-records/does-not-exist")
+    assert response.status_code == 404
 
-    try:
-        response = client.get("/download/测试_中文文档.docx")
-        assert response.status_code == 200
-        assert response.content == b"dummy docx content"
-    finally:
-        chinese_file.unlink(missing_ok=True)
+
+def test_clear_generation_records():
+    response = client.delete("/generation-records")
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 0
+
+
+def test_download_unicode_filename():
+    target = main.OUTPUT_DIR / "测试_中文文档.docx"
+    target.write_bytes(b"dummy docx content")
+
+    response = client.get("/download/测试_中文文档.docx")
+    assert response.status_code == 200
+    assert response.content == b"dummy docx content"
+
+
+def test_download_missing_file_returns_404():
+    response = client.get("/download/not-here.docx")
+    assert response.status_code == 404
+
+
+def test_download_rejects_path_traversal():
+    response = client.get("/download/..%2F..%2Fconfig.py")
+    assert response.status_code == 404
+
+
+def test_interrupted_jobs_are_failed_on_reload():
+    """Jobs live in-process only: a restart must not leave records stuck forever."""
+    import json
+
+    main.GENERATION_RECORDS_FILE.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "stuck",
+                    "prompt": "p",
+                    "status": "processing",
+                    "message": "后台正在生成 Word",
+                    "error": "",
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "done",
+                    "prompt": "p",
+                    "status": "completed",
+                    "message": "Word 生成完成",
+                    "error": "",
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    main.load_generation_records()
+
+    records = {record["id"]: record for record in main.list_generation_records(10)}
+    assert records["stuck"]["status"] == "failed"
+    assert records["stuck"]["error"]
+    assert records["done"]["status"] == "completed"
+
+
+def test_corrupt_records_file_is_ignored():
+    main.GENERATION_RECORDS_FILE.write_text("{ not json", encoding="utf-8")
+
+    main.load_generation_records()
+
+    assert main.list_generation_records(10) == []
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

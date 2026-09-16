@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from jinja2 import TemplateSyntaxError
 
 from services.ai_service import call_ai_generate_json
-from utils.files import ensure_unique_docx_path, sanitize_filename
+from utils.files import discard_output_path, ensure_unique_docx_path, sanitize_filename
 from utils.templates import extract_invalid_template_placeholders, extract_template_variables
 
 
@@ -66,6 +66,19 @@ def render_docx(template_path: Path, context: Dict[str, Any], output_docx: Path)
         raise HTTPException(status_code=500, detail=f"保存生成的文档失败: {str(exc)}")
 
 
+def _render_reserved(template_path: Path, context: Dict[str, Any], output_docx: Path) -> None:
+    """Render into a path claimed by ``ensure_unique_docx_path``.
+
+    The reservation is an empty file, so any failure must release it — otherwise
+    a zero-byte ``.docx`` would linger in ``outputs/`` and stay downloadable.
+    """
+    try:
+        render_docx(template_path, context, output_docx)
+    except BaseException:
+        discard_output_path(output_docx)
+        raise
+
+
 def generate_document(
     *,
     prompt: str,
@@ -90,7 +103,7 @@ def generate_document(
         temperature=temperature,
     )
     docx_filename, docx_path = ensure_unique_docx_path(output_dir, output_filename)
-    render_docx(template_path, ai_result, docx_path)
+    _render_reserved(template_path, ai_result, docx_path)
 
     return {
         "docx_filename": docx_filename,
@@ -110,7 +123,7 @@ def generate_default_document(
     template_path, variables = validate_template(template_name, upload_dir)
     context = {key: "" for key in variables}
     docx_filename, docx_path = ensure_unique_docx_path(output_dir, output_filename)
-    render_docx(template_path, context, docx_path)
+    _render_reserved(template_path, context, docx_path)
     return docx_filename
 
 

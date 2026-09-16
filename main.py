@@ -2,8 +2,10 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
+import sys
 from threading import Lock
 import time
 from typing import Any, Dict, List
@@ -75,10 +77,12 @@ def dump_generation_records() -> None:
     with generation_records_lock:
         records = list(generation_records.values())
         records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        GENERATION_RECORDS_FILE.write_text(
-            json.dumps(records, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        payload = json.dumps(records, ensure_ascii=False, indent=2)
+
+        # Write-then-rename: a crash mid-write must not truncate the whole history.
+        temp_file = GENERATION_RECORDS_FILE.with_name(GENERATION_RECORDS_FILE.name + ".tmp")
+        temp_file.write_text(payload, encoding="utf-8")
+        os.replace(temp_file, GENERATION_RECORDS_FILE)
 
 
 def load_generation_records() -> None:
@@ -88,15 +92,31 @@ def load_generation_records() -> None:
     try:
         records = json.loads(GENERATION_RECORDS_FILE.read_text(encoding="utf-8"))
         if not isinstance(records, list):
-            return
-    except Exception:
+            raise ValueError("记录文件格式不正确，期望 JSON 数组")
+    except Exception as exc:
+        print(f"[usdoc] 读取生成记录失败，已跳过: {exc}", file=sys.stderr)
         return
+
+    interrupted = False
+    current_time = now_iso()
 
     with generation_records_lock:
         generation_records.clear()
         for record in records:
-            if isinstance(record, dict) and record.get("id"):
-                generation_records[record["id"]] = record
+            if not isinstance(record, dict) or not record.get("id"):
+                continue
+            # Background jobs live in this process only, so anything still
+            # "pending"/"processing" died with the previous run.
+            if record.get("status") in ("pending", "processing"):
+                record["status"] = "failed"
+                record["message"] = "Word 生成失败"
+                record["error"] = "服务重启导致任务中断，请重新生成"
+                record["updated_at"] = current_time
+                interrupted = True
+            generation_records[record["id"]] = record
+
+    if interrupted:
+        dump_generation_records()
 
 
 def add_generation_record(req: GenerateRequest) -> Dict[str, Any]:

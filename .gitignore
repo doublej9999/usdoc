@@ -19,3 +19,4 @@ build/
 dist/
 ~$*.docx
 generation_records.json
+generation_records.json.tmp
