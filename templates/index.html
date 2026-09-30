@@ -38,7 +38,7 @@
       <h2>提示词输入区</h2>
       <label for="prompt">提示词</label>
       <textarea id="prompt" placeholder="例如：帮我写一份美国公司注册方案，预算500美元"></textarea>
-      <p class="status">批量导入时支持占位符：<code>{{excel_value}}</code> 或 <code>{excel_value}</code>。若留空提示词，则直接使用 Excel 指定列内容作为提示词。</p>
+      <p class="status">批量导入时支持占位符：{% raw %}<code>{{excel_value}}</code>{% endraw %} 或 <code>{excel_value}</code>。若留空提示词，则直接使用 Excel 指定列内容作为提示词。</p>
     </div>
 
     <div class="card">
@@ -160,6 +160,7 @@
     </div>
   </div>
 
+  {% raw %}
   <script>
     const templateFile = document.getElementById('templateFile');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -712,5 +713,6 @@
     loadSavedConfig();
     startPollingRecords();
   </script>
+  {% endraw %}
 </body>
 </html>

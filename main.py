@@ -1225,3 +1225,9 @@ async def download_file(filename: str):
 @app.exception_handler(Exception)
 async def unhandled_exception_to_json(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {str(exc)}"})
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8010"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
