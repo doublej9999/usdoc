@@ -726,66 +726,78 @@ async def generate_docx(req: GenerateRequest, background_tasks: BackgroundTasks)
 
 
 def execute_single_item(batch_id: str, item_id: str) -> None:
-    with batch_tasks_lock:
-        task = batch_tasks.get(batch_id)
-        if not task:
-            return
-        item = task.get("items", {}).get(item_id)
-        if not item:
-            return
-        item["status"] = "running"
-        item["error"] = ""
-        template_name = task["template_name"]
-        api_url = task["api_url"]
-        api_key = task["api_key"]
-        model = task["model"]
-        row_num = item["row_num"]
-        row_prompt = item["row_prompt"]
-        output_filename = item["output_filename"]
+    row_num = "?"
+    output_filename = ""
+    try:
+        with batch_tasks_lock:
+            task = batch_tasks.get(batch_id)
+            if not task:
+                return
+            item = task.get("items", {}).get(item_id)
+            if not item:
+                return
+            item["status"] = "running"
+            item["error"] = ""
+            template_name = task["template_name"]
+            api_url = task["api_url"]
+            api_key = task["api_key"]
+            model = task["model"]
+            row_num = item["row_num"]
+            row_prompt = item["row_prompt"]
+            output_filename = item["output_filename"]
 
-    append_batch_log(batch_id, "INFO", f"[行 {row_num}] 开始生成: {output_filename}")
-    update_batch_task_summary(batch_id)
+        append_batch_log(batch_id, "INFO", f"[行 {row_num}] 开始生成: {output_filename}")
+        update_batch_task_summary(batch_id)
 
-    req = GenerateRequest(
-        prompt=row_prompt,
-        api_url=api_url,
-        api_key=api_key,
-        model=model,
-        template_name=template_name,
-        output_filename=output_filename,
-    )
+        req = GenerateRequest(
+            prompt=row_prompt,
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            template_name=template_name,
+            output_filename=output_filename,
+        )
 
-    max_retries = 2
-    success = False
-    last_err = ""
-    for attempt in range(1, max_retries + 1):
-        try:
-            res = generate_common(req)
-            success = True
+        max_retries = 2
+        success = False
+        last_err = ""
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = generate_common(req)
+                success = True
+                with batch_tasks_lock:
+                    item = batch_tasks[batch_id]["items"][item_id]
+                    item["status"] = "success"
+                    item["generated_filename"] = res["docx_filename"]
+                    item["error"] = ""
+                append_batch_log(batch_id, "SUCCESS", f"[行 {row_num}] 生成成功: {res['docx_filename']}")
+                break
+            except HTTPException as he:
+                last_err = he.detail if isinstance(he.detail, str) else str(he.detail)
+                if attempt < max_retries:
+                    append_batch_log(batch_id, "WARNING", f"[行 {row_num}] 第 {attempt} 次重试失败: {last_err}")
+            except Exception as ex:
+                last_err = str(ex)
+                if attempt < max_retries:
+                    append_batch_log(batch_id, "WARNING", f"[行 {row_num}] 第 {attempt} 次重试失败: {last_err}")
+
+        if not success:
             with batch_tasks_lock:
                 item = batch_tasks[batch_id]["items"][item_id]
-                item["status"] = "success"
-                item["generated_filename"] = res["docx_filename"]
-                item["error"] = ""
-            append_batch_log(batch_id, "SUCCESS", f"[行 {row_num}] 生成成功: {res['docx_filename']}")
-            break
-        except HTTPException as he:
-            last_err = he.detail if isinstance(he.detail, str) else str(he.detail)
-            if attempt < max_retries:
-                append_batch_log(batch_id, "WARNING", f"[行 {row_num}] 第 {attempt} 次重试失败: {last_err}")
-        except Exception as ex:
-            last_err = str(ex)
-            if attempt < max_retries:
-                append_batch_log(batch_id, "WARNING", f"[行 {row_num}] 第 {attempt} 次重试失败: {last_err}")
+                item["status"] = "failed"
+                item["error"] = last_err
+            append_batch_log(batch_id, "ERROR", f"[行 {row_num}] 生成失败: {last_err}")
 
-    if not success:
+    except BaseException as fatal_ex:
+        last_err = str(fatal_ex)
         with batch_tasks_lock:
-            item = batch_tasks[batch_id]["items"][item_id]
-            item["status"] = "failed"
-            item["error"] = last_err
-        append_batch_log(batch_id, "ERROR", f"[行 {row_num}] 生成失败: {last_err}")
-
-    update_batch_task_summary(batch_id)
+            if batch_id in batch_tasks and item_id in batch_tasks[batch_id].get("items", {}):
+                item = batch_tasks[batch_id]["items"][item_id]
+                item["status"] = "failed"
+                item["error"] = f"严重异常: {last_err}"
+        append_batch_log(batch_id, "ERROR", f"[行 {row_num}] 处理发生意外中断: {last_err}")
+    finally:
+        update_batch_task_summary(batch_id)
 
 
 def run_batch_generation_task(batch_id: str, concurrency: int = 5) -> None:
@@ -805,6 +817,26 @@ def run_batch_generation_task(batch_id: str, concurrency: int = 5) -> None:
                 future.result()
             except Exception as exc:
                 append_batch_log(batch_id, "ERROR", f"执行异常: {str(exc)}")
+
+    # 状态终结核对（Reconciliation）：确保线程池退出后，所有项绝不残留 running/pending 假死状态
+    with batch_tasks_lock:
+        task = batch_tasks.get(batch_id)
+        if task:
+            for item in task.get("items", {}).values():
+                if item.get("status") in ("running", "pending"):
+                    out_name = item.get("output_filename", "")
+                    gen_name = item.get("generated_filename") or out_name
+                    # 检查磁盘是否已经生成该文件
+                    if gen_name and (OUTPUT_DIR / gen_name).exists():
+                        item["status"] = "success"
+                        item["generated_filename"] = gen_name
+                        item["error"] = ""
+                    else:
+                        item["status"] = "failed"
+                        if not item.get("error"):
+                            item["error"] = "批处理意外中断或未返回结果"
+
+    update_batch_task_summary(batch_id)
 
     # 尝试更新一次压缩包
     zip_name = repack_batch_zip(batch_id)
