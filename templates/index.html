@@ -188,8 +188,25 @@
     const apiKeyInput = document.getElementById('apiKey');
     const outputFilenameInput = document.getElementById('outputFilename');
 
+    // 批量生成相关 DOM 元素
+    const batchSection = document.getElementById('batchSection');
+    const batchProgressBar = document.getElementById('batchProgressBar');
+    const batchStatTotal = document.getElementById('batchStatTotal');
+    const batchStatSuccess = document.getElementById('batchStatSuccess');
+    const batchStatFailed = document.getElementById('batchStatFailed');
+    const batchStatStatus = document.getElementById('batchStatStatus');
+    const batchTerminal = document.getElementById('batchTerminal');
+    const batchDownloadBtn = document.getElementById('batchDownloadBtn');
+    const batchFailedSection = document.getElementById('batchFailedSection');
+    const batchFailedItemsList = document.getElementById('batchFailedItemsList');
+    const retryAllFailedBtn = document.getElementById('retryAllFailedBtn');
+    const concurrencySelect = document.getElementById('concurrencySelect');
+
     let recordsPollTimer = null;
     let uploadedTemplateName = '';
+    let currentBatchId = null;
+    let batchPollTimer = null;
+    let lastLogCount = 0;
 
     // 本地存储记忆项（优化 1）
     const STORAGE_KEY_CONFIG = 'usdoc_config_prefs';
@@ -497,23 +514,6 @@
         genPdfBtn.disabled = false;
       }
     }
-
-    let currentBatchId = null;
-    let batchPollTimer = null;
-    let lastLogCount = 0;
-
-    const batchSection = document.getElementById('batchSection');
-    const batchProgressBar = document.getElementById('batchProgressBar');
-    const batchStatTotal = document.getElementById('batchStatTotal');
-    const batchStatSuccess = document.getElementById('batchStatSuccess');
-    const batchStatFailed = document.getElementById('batchStatFailed');
-    const batchStatStatus = document.getElementById('batchStatStatus');
-    const batchTerminal = document.getElementById('batchTerminal');
-    const batchDownloadBtn = document.getElementById('batchDownloadBtn');
-    const batchFailedSection = document.getElementById('batchFailedSection');
-    const batchFailedItemsList = document.getElementById('batchFailedItemsList');
-    const retryAllFailedBtn = document.getElementById('retryAllFailedBtn');
-    const concurrencySelect = document.getElementById('concurrencySelect');
 
     function renderBatchTask(task) {
       if (!task) return;
