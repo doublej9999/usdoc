@@ -534,6 +534,18 @@
       if (task.status === 'completed') statusText = '全部完成';
       else if (task.status === 'partial_failed') statusText = '部分失败';
       else if (task.status === 'failed') statusText = '全部失败';
+
+      // 终态兜底：若所有任务项已无运行中与等待中，且下载包已就绪，状态收敛为完成
+      const runningCount = task.running_count || 0;
+      const pendingCount = task.pending_count || 0;
+      if (runningCount === 0 && pendingCount === 0 && (task.status === 'completed' || completed >= total)) {
+        statusText = (task.failed_count > 0) ? '部分失败' : '全部完成';
+        if (total > 0 && completed >= total) {
+          batchProgressBar.style.width = '100%';
+          batchProgressBar.textContent = '100%';
+        }
+      }
+
       batchStatStatus.textContent = statusText;
 
       // 下载按钮
